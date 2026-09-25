@@ -6,6 +6,8 @@ mod covers;
 mod errors;
 mod hearts;
 mod login;
+#[cfg(feature = "webview")]
+mod login_window;
 mod mpris;
 mod now_playing;
 mod preferences;

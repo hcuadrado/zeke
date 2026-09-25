@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
+[features]
+default = ["webview"]
+# TIDAL's login page in a window of Zeke's own (WebKitGTK 6.0). Without it
+# the login goes through the web browser and a pasted address.
+webview = ["dep:webkit6"]
+
 [dependencies]
 adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
 async-channel = "2"
@@ -18,6 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 serde = "1"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "rt", "signal", "sync", "time", "macros"] }
+webkit6 = { version = "0.6", optional = true }
 zeke-engine = { path = "../crates/engine" }
 zeke-player = { path = "../crates/player" }
 zeke-tidal = { path = "../crates/tidal" }

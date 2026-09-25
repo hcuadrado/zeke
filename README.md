@@ -27,7 +27,8 @@ MPRIS and keyboard shortcuts.
 
 ```sh
 sudo zypper in gtk4-devel libadwaita-devel gstreamer-devel gstreamer-plugins-base-devel \
-  gstreamer-plugins-good gstreamer-plugins-bad gstreamer-utils alsa-devel blueprint-compiler
+  gstreamer-plugins-good gstreamer-plugins-bad gstreamer-utils alsa-devel blueprint-compiler \
+  webkitgtk4-devel libsoup-devel
 cargo run -p zeke
 ```
 

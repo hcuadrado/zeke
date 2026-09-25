@@ -32,18 +32,18 @@ template $ZekeWindow: Adw.ApplicationWindow {
           content: Adw.StatusPage {
             icon-name: "audio-x-generic-symbolic";
             title: "Sign in to TIDAL";
-            description: "Zeke opens TIDAL’s login page in your browser. After signing in, copy the address of the page you land on (it starts with https://tidal.com/android/login/auth?code=) and paste it below.";
+            description: "Zeke plays music from your TIDAL account. You sign in on TIDAL’s own page, so your password never goes through Zeke.";
 
             child: Box {
               orientation: vertical;
-              spacing: 18;
+              spacing: 12;
               halign: center;
-              width-request: 360;
+              width-request: 400;
 
-              Button open_login_button {
-                label: "Open TIDAL Login";
+              Button sign_in_button {
+                label: "Sign in with TIDAL";
                 halign: center;
-                clicked => $on_open_login() swapped;
+                clicked => $on_sign_in() swapped;
 
                 styles [
                   "pill",
@@ -51,25 +51,82 @@ template $ZekeWindow: Adw.ApplicationWindow {
                 ]
               }
 
-              ListBox {
-                selection-mode: none;
+              Label sign_in_hint {
+                label: "TIDAL’s login page opens in a window of its own. Come back here when you’re done.";
+                wrap: true;
+                justify: center;
+                max-width-chars: 44;
 
                 styles [
-                  "boxed-list",
+                  "dim-label",
+                  "caption",
                 ]
-
-                Adw.EntryRow login_entry {
-                  title: "Redirect address or code";
-                  sensitive: false;
-                  show-apply-button: true;
-                  apply => $on_login_apply() swapped;
-                  entry-activated => $on_login_apply() swapped;
-                }
               }
 
-              Adw.Spinner login_spinner {
-                visible: false;
+              Button use_browser_button {
+                label: "Use your web browser instead";
                 halign: center;
+                margin-top: 6;
+                clicked => $on_use_browser() swapped;
+
+                styles [
+                  "flat",
+                ]
+              }
+
+              Revealer browser_steps {
+                reveal-child: false;
+                transition-type: slide_down;
+
+                child: ListBox {
+                  selection-mode: none;
+                  margin-top: 6;
+
+                  styles [
+                    "boxed-list",
+                  ]
+
+                  Adw.ActionRow {
+                    title: "1. Open TIDAL’s login page";
+                    subtitle: "It opens in your web browser.";
+                    activatable-widget: open_login_button;
+
+                    [suffix]
+                    Button open_login_button {
+                      label: "Open";
+                      valign: center;
+                      clicked => $on_open_login() swapped;
+                    }
+                  }
+
+                  Adw.ActionRow {
+                    title: "2. Sign in there";
+                    subtitle: "Afterwards the browser lands on an address that starts with tidal.com/android/login/auth?code=… The page itself may look empty or say the link can’t be opened. That’s expected: the address is what you need.";
+                  }
+
+                  Adw.EntryRow login_entry {
+                    title: "3. Paste that address here";
+                    sensitive: false;
+                    show-apply-button: true;
+                    apply => $on_login_apply() swapped;
+                    entry-activated => $on_login_apply() swapped;
+                  }
+                };
+              }
+
+              Box login_progress {
+                visible: false;
+                spacing: 8;
+                halign: center;
+                margin-top: 6;
+
+                Adw.Spinner {}
+
+                Label login_status {
+                  styles [
+                    "dim-label",
+                  ]
+                }
               }
             };
           };

@@ -41,11 +41,21 @@ mod imp {
         #[template_child]
         pub nav_view: TemplateChild<adw::NavigationView>,
         #[template_child]
+        pub sign_in_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub sign_in_hint: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub use_browser_button: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub browser_steps: TemplateChild<gtk::Revealer>,
+        #[template_child]
         pub open_login_button: TemplateChild<gtk::Button>,
         #[template_child]
         pub login_entry: TemplateChild<adw::EntryRow>,
         #[template_child]
-        pub login_spinner: TemplateChild<adw::Spinner>,
+        pub login_progress: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub login_status: TemplateChild<gtk::Label>,
         #[template_child]
         pub sheet: TemplateChild<adw::BottomSheet>,
         #[template_child]
@@ -350,6 +360,17 @@ impl ZekeWindow {
     #[template_callback]
     fn on_open_sheet(&self) {
         self.imp().sheet.set_open(true);
+    }
+
+    #[template_callback]
+    fn on_sign_in(&self) {
+        #[cfg(feature = "webview")]
+        self.open_login_window();
+    }
+
+    #[template_callback]
+    fn on_use_browser(&self) {
+        self.use_browser();
     }
 
     #[template_callback]

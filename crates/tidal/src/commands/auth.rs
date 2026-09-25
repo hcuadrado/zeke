@@ -175,6 +175,20 @@ pub fn start_pkce_browser_login() -> Result<PkceAuthParams, TidalError> {
     Ok(build_pkce_params(&client_id))
 }
 
+/// The authorization code in the address TIDAL's login redirects to
+/// (`PKCE_REDIRECT_URI?code=…`). `None` for any other address, so a login
+/// window can watch every navigation and act on this one only.
+pub fn redirect_code(url: &str) -> Option<String> {
+    let url = url::Url::parse(url.trim()).ok()?;
+    if url.host_str() != Some("tidal.com") || url.path() != "/android/login/auth" {
+        return None;
+    }
+    url.query_pairs()
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned())
+        .filter(|c| !c.is_empty())
+}
+
 /// Take the authorization code from what the user pasted: the `code` query
 /// parameter of the redirect URL, or the raw string when it isn't a URL.
 pub fn extract_pkce_code(pasted: &str) -> Option<String> {
@@ -208,6 +222,18 @@ mod tests {
         assert_eq!(extract_pkce_code("short"), None);
         assert_eq!(extract_pkce_code("has a space in it"), None);
         assert_eq!(extract_pkce_code("https://tidal.com/android/login/auth?x=1"), None);
+    }
+
+    #[test]
+    fn redirect_code_matches_the_redirect_uri_only() {
+        assert_eq!(
+            redirect_code("https://tidal.com/android/login/auth?code=abc123XYZ&state=na").as_deref(),
+            Some("abc123XYZ")
+        );
+        assert_eq!(redirect_code("https://tidal.com/android/login/auth?x=1"), None);
+        assert_eq!(redirect_code("https://login.tidal.com/authorize?code=abc123XYZ"), None);
+        assert_eq!(redirect_code("https://tidal.com/browse?code=abc123XYZ"), None);
+        assert_eq!(redirect_code("abcdefghijkl"), None);
     }
 
     #[test]
