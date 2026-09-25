@@ -26,6 +26,9 @@ mod imp {
         pub length: RefCell<String>,
         #[property(get, set)]
         pub current: Cell<bool>,
+        /// Played already: before the current entry.
+        #[property(get, set)]
+        pub past: Cell<bool>,
     }
 
     #[glib::object_subclass]

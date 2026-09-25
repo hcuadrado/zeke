@@ -37,12 +37,28 @@ impl ZekeWindow {
             ));
         }
 
+        let escape = gtk::ShortcutController::new();
+        escape.add_shortcut(gtk::Shortcut::new(
+            gtk::ShortcutTrigger::parse_string("Escape"),
+            Some(gtk::CallbackAction::new(glib::clone!(
+                #[weak(rename_to = window)]
+                self,
+                #[upgrade_or]
+                glib::Propagation::Proceed,
+                move |_, _| {
+                    window.imp().sheet.set_open(false);
+                    glib::Propagation::Stop
+                }
+            ))),
+        ));
+        imp.sheet_content.add_controller(escape);
+
         // The title and artist open the sheet, as the cover does.
         let click = gtk::GestureClick::new();
         click.connect_released(glib::clone!(
             #[weak(rename_to = window)]
             self,
-            move |_, _, _, _| window.imp().sheet.set_open(true)
+            move |_, _, _, _| window.on_open_sheet()
         ));
         imp.bar_track_labels.add_controller(click);
         imp.bar_track_labels.set_cursor_from_name(Some("pointer"));
@@ -305,6 +321,35 @@ impl ZekeWindow {
             }
             imp.queue_current.set(now.as_ref());
         }
+        // Played entries are dimmed: a history above, the queue below.
+        for (i, row) in store.iter::<QueueRow>().flatten().enumerate() {
+            if row.past() != (i < current) {
+                row.set_past(i < current);
+            }
+        }
+    }
+
+    /// Scroll the queue so the current entry is its first visible row
+    /// (the sheet opening). Waits for the list to be laid out first.
+    pub fn scroll_queue_to_current(&self) {
+        let imp = self.imp();
+        let (Some(store), Some(row)) = (imp.queue.get(), imp.queue_current.upgrade()) else { return };
+        let Some(current) = store.find(&row) else { return };
+        let frames = std::cell::Cell::new(0);
+        imp.queue_view.add_tick_callback(move |view, _| {
+            frames.set(frames.get() + 1);
+            let adj = view.vadjustment().expect("in a ScrolledWindow");
+            if adj.page_size() <= 0.0 && frames.get() < 30 {
+                return glib::ControlFlow::Continue;
+            }
+            // Rows are all one height: title over artist.
+            let n = view.model().map_or(0, |m| m.n_items());
+            if n > 0 {
+                let row_height = adj.upper() / f64::from(n);
+                adj.set_value((f64::from(current) * row_height).min(adj.upper() - adj.page_size()));
+            }
+            glib::ControlFlow::Break
+        });
     }
 
     pub fn refresh_queue_rows(&self, track_id: u64) {
@@ -385,6 +430,12 @@ fn queue_factory() -> gtk::SignalListItemFactory {
             text.bind(label, "tooltip-text", gtk::Widget::NONE);
         }
         row_item.chain_property::<QueueRow>("length").bind(&length, "label", gtk::Widget::NONE);
+        row_item
+            .chain_property::<QueueRow>("past")
+            .chain_closure::<Vec<String>>(glib::closure!(|_: Option<glib::Object>, p: bool| {
+                if p { vec!["queue-past".to_string()] } else { Vec::new() }
+            }))
+            .bind(&row, "css-classes", gtk::Widget::NONE);
     });
     factory
 }

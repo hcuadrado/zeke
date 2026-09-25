@@ -59,6 +59,10 @@ mod imp {
         #[template_child]
         pub sheet: TemplateChild<adw::BottomSheet>,
         #[template_child]
+        pub sheet_content: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub sheet_close: TemplateChild<gtk::Button>,
+        #[template_child]
         pub sheet_cover: TemplateChild<gtk::Picture>,
         #[template_child]
         pub sheet_title: TemplateChild<gtk::Label>,
@@ -366,8 +370,23 @@ impl ZekeWindow {
     }
 
     #[template_callback]
-    fn on_open_sheet(&self) {
-        self.imp().sheet.set_open(true);
+    pub fn on_open_sheet(&self) {
+        let imp = self.imp();
+        imp.sheet.set_open(true);
+        self.scroll_queue_to_current();
+        // The bar hides as the sheet opens; focus inside it, so Escape works
+        // (next idle: the sheet is only mapped once it starts opening).
+        let close = imp.sheet_close.downgrade();
+        glib::idle_add_local_once(move || {
+            if let Some(close) = close.upgrade() {
+                close.grab_focus();
+            }
+        });
+    }
+
+    #[template_callback]
+    fn on_close_sheet(&self) {
+        self.imp().sheet.set_open(false);
     }
 
     #[template_callback]

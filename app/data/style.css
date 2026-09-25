@@ -35,6 +35,11 @@ menubutton.quality-badge > button {
   background-color: var(--warning-color);
 }
 
+/* Played entries in the queue: history, not what's next. */
+.queue-past {
+  opacity: 0.45;
+}
+
 .queue-current {
   color: var(--accent-color);
   font-weight: bold;

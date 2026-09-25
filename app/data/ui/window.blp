@@ -299,221 +299,269 @@ template $ZekeWindow: Adw.ApplicationWindow {
               };
             };
 
-            sheet: ScrolledWindow {
-              hscrollbar-policy: never;
-              propagate-natural-height: true;
+            sheet: Box sheet_content {
+              orientation: vertical;
 
-              child: Box now_playing_box {
-                orientation: horizontal;
-                spacing: 24;
-                margin-top: 12;
-                margin-bottom: 24;
-                margin-start: 24;
-                margin-end: 24;
+              // Clear of the sheet's drag handle.
+              CenterBox {
+                margin-top: 18;
+                margin-start: 12;
+                margin-end: 12;
 
-                // Wide: a fixed column, so the queue takes the rest of the
-                // width and its titles fit. Narrow: stacked, full width.
-                Box {
-                  orientation: vertical;
-                  spacing: 12;
-                  width-request: 300;
-                  valign: start;
+                center-widget: Label {
+                  label: "Now Playing";
 
-                  Picture sheet_cover {
-                    width-request: 280;
-                    height-request: 280;
-                    halign: center;
-                    content-fit: cover;
-                    can-shrink: true;
+                  styles [
+                    "heading",
+                  ]
+                };
 
-                    styles [
-                      "cover",
-                    ]
-                  }
+                end-widget: Button sheet_close {
+                  icon-name: "go-down-symbolic";
+                  tooltip-text: "Close (Esc)";
+                  clicked => $on_close_sheet() swapped;
 
-                  Label sheet_title {
-                    wrap: true;
-                    justify: center;
+                  styles [
+                    "flat",
+                    "circular",
+                  ]
+                };
+              }
 
-                    styles [
-                      "title-2",
-                    ]
-                  }
+              ScrolledWindow {
+                hscrollbar-policy: never;
+                propagate-natural-height: true;
 
-                  Label sheet_artist {
-                    wrap: true;
-                    justify: center;
-                  }
+                child: Box now_playing_box {
+                  orientation: horizontal;
+                  spacing: 24;
+                  margin-top: 6;
+                  margin-bottom: 24;
+                  margin-start: 24;
+                  margin-end: 24;
 
-                  Label sheet_album {
-                    wrap: true;
-                    justify: center;
+                  // Wide: a fixed column, so the queue takes the rest of the
+                  // width and its titles fit. Narrow: stacked, full width.
+                  // The clamp keeps a long title wrapping, not widening it.
+                  Adw.Clamp {
+                    maximum-size: 300;
+                    tightening-threshold: 300;
+                    valign: start;
 
-                    styles [
-                      "dim-label",
-                    ]
-                  }
+                    child: Box {
+                      orientation: vertical;
+                      spacing: 12;
 
-                  Box {
-                    spacing: 8;
-                    halign: center;
+                      // Its 640px texture would widen the column otherwise
+                      // (see the bar's cover).
+                      Adw.Clamp {
+                        maximum-size: 260;
+                        tightening-threshold: 260;
+                        halign: center;
 
-                    Label sheet_badge {
-                      valign: center;
-                      visible: false;
+                        child: Adw.Clamp {
+                          orientation: vertical;
+                          maximum-size: 260;
+                          tightening-threshold: 260;
 
-                      styles [
-                        "quality-badge",
-                        "dim-label",
-                      ]
-                    }
+                          child: Picture sheet_cover {
+                            width-request: 260;
+                            height-request: 260;
+                            content-fit: cover;
+                            can-shrink: true;
 
-                    Button sheet_heart {
-                      icon-name: "heart-outline-symbolic";
-                      valign: center;
-                      visible: false;
+                            styles [
+                              "cover",
+                            ]
+                          };
+                        };
+                      }
 
-                      styles [
-                        "flat",
-                        "circular",
-                        "heart",
-                      ]
-                    }
-                  }
+                      Label sheet_title {
+                        wrap: true;
+                        justify: center;
 
-                  Box {
-                    spacing: 8;
+                        styles [
+                          "title-2",
+                        ]
+                      }
 
-                    Label sheet_elapsed {
-                      label: "0:00";
-                      width-chars: 5;
+                      Label sheet_artist {
+                        wrap: true;
+                        justify: center;
+                      }
 
-                      styles [
-                        "numeric",
-                        "dim-label",
-                      ]
-                    }
+                      Label sheet_album {
+                        wrap: true;
+                        justify: center;
 
-                    Scale sheet_seek {
-                      hexpand: true;
-                      adjustment: Adjustment {
-                        lower: 0;
-                        upper: 1;
-                      };
-                    }
+                        styles [
+                          "dim-label",
+                        ]
+                      }
 
-                    Label sheet_total {
-                      label: "0:00";
-                      width-chars: 5;
+                      Box {
+                        spacing: 8;
+                        halign: center;
 
-                      styles [
-                        "numeric",
-                        "dim-label",
-                      ]
-                    }
-                  }
+                        Label sheet_badge {
+                          valign: center;
+                          visible: false;
 
-                  Box {
-                    spacing: 12;
-                    halign: center;
+                          styles [
+                            "quality-badge",
+                            "dim-label",
+                          ]
+                        }
 
-                    ToggleButton {
-                      icon-name: "media-playlist-shuffle-symbolic";
-                      tooltip-text: "Shuffle";
-                      action-name: "win.shuffle";
-                      valign: center;
+                        Button sheet_heart {
+                          icon-name: "heart-outline-symbolic";
+                          valign: center;
+                          visible: false;
 
-                      styles [
-                        "flat",
-                        "circular",
-                      ]
-                    }
+                          styles [
+                            "flat",
+                            "circular",
+                            "heart",
+                          ]
+                        }
+                      }
 
-                    Button {
-                      icon-name: "media-skip-backward-symbolic";
-                      tooltip-text: "Previous";
-                      action-name: "win.previous";
-                      valign: center;
+                      Box {
+                        spacing: 8;
 
-                      styles [
-                        "flat",
-                        "circular",
-                      ]
-                    }
+                        Label sheet_elapsed {
+                          label: "0:00";
+                          width-chars: 5;
 
-                    Button sheet_play {
-                      icon-name: "media-playback-start-symbolic";
-                      tooltip-text: "Play";
-                      action-name: "win.play-pause";
-                      width-request: 56;
-                      height-request: 56;
+                          styles [
+                            "numeric",
+                            "dim-label",
+                          ]
+                        }
 
-                      styles [
-                        "circular",
-                        "suggested-action",
-                      ]
-                    }
+                        Scale sheet_seek {
+                          hexpand: true;
+                          adjustment: Adjustment {
+                            lower: 0;
+                            upper: 1;
+                          };
+                        }
 
-                    Button {
-                      icon-name: "media-skip-forward-symbolic";
-                      tooltip-text: "Next";
-                      action-name: "win.next";
-                      valign: center;
+                        Label sheet_total {
+                          label: "0:00";
+                          width-chars: 5;
 
-                      styles [
-                        "flat",
-                        "circular",
-                      ]
-                    }
+                          styles [
+                            "numeric",
+                            "dim-label",
+                          ]
+                        }
+                      }
 
-                    Button sheet_repeat {
-                      icon-name: "media-playlist-repeat-symbolic";
-                      tooltip-text: "Repeat: off";
-                      action-name: "win.cycle-repeat";
-                      valign: center;
+                      Box {
+                        spacing: 12;
+                        halign: center;
 
-                      styles [
-                        "flat",
-                        "circular",
-                      ]
-                    }
-                  }
-                }
+                        ToggleButton {
+                          icon-name: "media-playlist-shuffle-symbolic";
+                          tooltip-text: "Shuffle";
+                          action-name: "win.shuffle";
+                          valign: center;
 
-                Box {
-                  orientation: vertical;
-                  spacing: 6;
-                  hexpand: true;
+                          styles [
+                            "flat",
+                            "circular",
+                          ]
+                        }
 
-                  Label {
-                    label: "Queue";
-                    xalign: 0;
+                        Button {
+                          icon-name: "media-skip-backward-symbolic";
+                          tooltip-text: "Previous";
+                          action-name: "win.previous";
+                          valign: center;
 
-                    styles [
-                      "heading",
-                    ]
-                  }
+                          styles [
+                            "flat",
+                            "circular",
+                          ]
+                        }
 
-                  ScrolledWindow {
-                    hscrollbar-policy: never;
-                    vexpand: true;
-                    min-content-height: 320;
+                        Button sheet_play {
+                          icon-name: "media-playback-start-symbolic";
+                          tooltip-text: "Play";
+                          action-name: "win.play-pause";
+                          width-request: 56;
+                          height-request: 56;
 
-                    child: ListView queue_view {
-                      single-click-activate: true;
-                      activate => $on_queue_activate() swapped;
+                          styles [
+                            "circular",
+                            "suggested-action",
+                          ]
+                        }
 
-                      styles [
-                        "navigation-sidebar",
-                      ]
+                        Button {
+                          icon-name: "media-skip-forward-symbolic";
+                          tooltip-text: "Next";
+                          action-name: "win.next";
+                          valign: center;
+
+                          styles [
+                            "flat",
+                            "circular",
+                          ]
+                        }
+
+                        Button sheet_repeat {
+                          icon-name: "media-playlist-repeat-symbolic";
+                          tooltip-text: "Repeat: off";
+                          action-name: "win.cycle-repeat";
+                          valign: center;
+
+                          styles [
+                            "flat",
+                            "circular",
+                          ]
+                        }
+                      }
                     };
-
-                    styles [
-                      "card",
-                    ]
                   }
-                }
-              };
+
+                  Box {
+                    orientation: vertical;
+                    spacing: 6;
+                    hexpand: true;
+
+                    Label {
+                      label: "Queue";
+                      xalign: 0;
+
+                      styles [
+                        "heading",
+                      ]
+                    }
+
+                    ScrolledWindow {
+                      hscrollbar-policy: never;
+                      vexpand: true;
+                      min-content-height: 320;
+
+                      child: ListView queue_view {
+                        single-click-activate: true;
+                        activate => $on_queue_activate() swapped;
+
+                        styles [
+                          "navigation-sidebar",
+                        ]
+                      };
+
+                      styles [
+                        "card",
+                      ]
+                    }
+                  }
+                };
+              }
             };
           };
 
