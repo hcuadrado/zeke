@@ -13,9 +13,28 @@ authentication, persistence and audio engine are derived from SONE's Rust
 backend (GPL-3.0). `NOTICE` lists the derived files. Zeke is not affiliated
 with SONE or TIDAL.
 
-**Status:** MVP. PKCE login, Home, search, favorites, album/playlist/artist/mix
-pages, gapless hi-res playback (optional exclusive ALSA), a saved queue,
-MPRIS and keyboard shortcuts.
+## Status
+
+MVP: the core player is complete. What it does today:
+
+- **Sign-in:** TIDAL login in a window of Zeke's own; the session is kept
+  and refreshed.
+- **Browse:** the personalized Home feed, search, favorites (tracks,
+  albums, artists, playlists), and album, playlist, artist and mix pages.
+- **Playback:** gapless, up to 24-bit/192 kHz, with a quality cap, an
+  output device picker, optional exclusive (bit-perfect) ALSA output and
+  ReplayGain.
+- **Queue:** shuffle, repeat and seek; a now-playing sheet; the queue is
+  saved across restarts. Long playlists start playing before they have
+  fully loaded.
+- **Desktop:** a quality badge (e.g. FLAC 24/192), MPRIS media controls,
+  keyboard shortcuts, light and dark styles.
+
+### Next
+
+- Lyrics
+- Animated covers
+- Video playback
 
 ## Layout
 
