@@ -320,7 +320,10 @@ fn queue_factory() -> gtk::SignalListItemFactory {
         item.set_child(Some(&row));
 
         item.property_expression("position")
-            .chain_closure::<String>(glib::closure!(|_: Option<glib::Object>, p: u32| (p + 1).to_string()))
+            .chain_closure::<String>(glib::closure!(|_: Option<glib::Object>, p: u32| {
+                // An unbound row reports GTK_INVALID_LIST_POSITION (u32::MAX).
+                p.checked_add(1).map(|n| n.to_string()).unwrap_or_default()
+            }))
             .bind(&place, "label", gtk::Widget::NONE);
         let row_item = item.property_expression("item");
         let current = row_item.chain_property::<QueueRow>("current");
