@@ -95,9 +95,9 @@ pub struct Settings {
     pub volume: f32,
     #[serde(default = "defaults::max_quality")]
     pub max_quality: String,
-    /// On by default: the target laptop only reaches 48 kHz through
-    /// exclusive ALSA with the engine's own resampler.
-    #[serde(default = "defaults::yes")]
+    /// Off by default: playback goes through the system mixer (PipeWire)
+    /// unless the user opts into exclusive ALSA in Preferences.
+    #[serde(default)]
     pub exclusive_mode: bool,
     /// Stored as `hw:CARD=<id>,DEV=<n>`, which survives card renumbering.
     /// Empty: the app picks the first analog device at startup.
@@ -124,7 +124,7 @@ impl Default for Settings {
             client_secret: String::new(),
             volume: 1.0,
             max_quality: defaults::max_quality(),
-            exclusive_mode: true,
+            exclusive_mode: false,
             exclusive_device: None,
             bit_perfect: false,
             gapless: true,
@@ -269,9 +269,9 @@ mod settings_tests {
     // Existing configs predate fields, so the serde defaults govern upgrades —
     // not just Settings::default(). Both must give the plan's §1.1 defaults.
     #[test]
-    fn audio_defaults_are_exclusive_without_bit_perfect() {
+    fn audio_defaults_are_normal_output_without_bit_perfect() {
         for s in [Settings::default(), serde_json::from_str::<Settings>("{}").unwrap()] {
-            assert!(s.exclusive_mode);
+            assert!(!s.exclusive_mode);
             assert!(!s.bit_perfect);
             assert!(s.gapless);
             assert_eq!(s.max_quality, "HI_RES_LOSSLESS");

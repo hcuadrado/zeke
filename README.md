@@ -10,7 +10,7 @@ backend (GPL-3.0). `NOTICE` lists the derived files. Zeke is not affiliated
 with SONE or TIDAL.
 
 **Status:** MVP. PKCE login, Home, search, favorites, album/playlist/artist/mix
-pages, gapless hi-res playback (exclusive ALSA by default), a saved queue,
+pages, gapless hi-res playback (optional exclusive ALSA), a saved queue,
 MPRIS and keyboard shortcuts.
 
 ## Layout

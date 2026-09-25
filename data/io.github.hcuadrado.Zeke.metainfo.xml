@@ -10,7 +10,7 @@
   <description>
     <p>
       Zeke is a native TIDAL player for Linux, built for hi-res lossless
-      playback (up to 24-bit/192 kHz FLAC). It plays through ALSA in
+      playback (up to 24-bit/192 kHz FLAC). It can play through ALSA in
       exclusive mode, bit-perfect when the output device takes the track’s
       rate and with one high-quality resample when it doesn’t, and it is
       gapless across tracks in every mode.

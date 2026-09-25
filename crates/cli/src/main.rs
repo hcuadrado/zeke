@@ -96,7 +96,7 @@ struct OutputArgs {
     /// ALSA device for exclusive mode, e.g. hw:0,0 (default: the saved one)
     #[arg(long)]
     device: Option<String>,
-    /// Exclusive ALSA output (default: the saved setting, on)
+    /// Exclusive ALSA output (default: the saved setting, off)
     #[arg(long, overrides_with = "no_exclusive")]
     exclusive: bool,
     /// Normal output through the system mixer (PipeWire)
