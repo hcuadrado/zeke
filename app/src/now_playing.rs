@@ -173,6 +173,7 @@ impl ZekeWindow {
     pub fn refresh_now_playing(&self) {
         let imp = self.imp();
         let Some(now) = imp.now.borrow().clone() else { return };
+        self.refresh_track_rows();
         let meta = imp.metas.borrow().get(&now.track_id).cloned();
         let (title, artist, album) = match &meta {
             Some(m) => (m.title.clone(), m.artist.clone(), m.album.clone()),
@@ -247,6 +248,7 @@ impl ZekeWindow {
     pub fn clear_now_playing(&self) {
         let imp = self.imp();
         imp.now.take();
+        self.refresh_track_rows();
         imp.bar_title.set_label("Nothing playing");
         imp.bar_artist.set_label("");
         imp.sheet_title.set_label("Nothing playing");

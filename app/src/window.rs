@@ -142,6 +142,8 @@ mod imp {
         pub account: Cell<Option<u64>>,
         /// Re-draw the player bar's and the sheet's hearts (track change).
         pub now_hearts: RefCell<crate::hearts::Redraws>,
+        /// Browse track rows, to re-mark the playing track on a change.
+        pub track_rows: RefCell<Vec<glib::WeakRef<crate::browse::views::TrackRow>>>,
     }
 
     #[glib::object_subclass]

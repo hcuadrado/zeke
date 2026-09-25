@@ -17,9 +17,10 @@ use crate::queue_row::format_time;
 use crate::window::ZekeWindow;
 
 /// How a track list shows its rows.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrackStyle {
     /// Track numbers, no covers: an album's own tracks.
+    #[default]
     Album,
     /// A cover per row and the album under the title.
     Mixed,
@@ -31,6 +32,8 @@ mod imp {
     #[derive(Debug, Default)]
     pub struct TrackRow {
         pub number: gtk::Label,
+        /// In the number's place on the playing track (album lists).
+        pub playing: gtk::Image,
         pub cover: gtk::Picture,
         pub title: gtk::Label,
         pub subtitle: gtk::Label,
@@ -40,6 +43,7 @@ mod imp {
         /// "row.*": play next, add to queue, go to album / artist.
         pub actions: gio::SimpleActionGroup,
         pub item: RefCell<Option<TrackObject>>,
+        pub style: std::cell::Cell<TrackStyle>,
     }
 
     #[glib::object_subclass]
@@ -91,6 +95,7 @@ impl TrackRow {
     fn new(style: TrackStyle) -> Self {
         let row: Self = glib::Object::builder().property("spacing", 12).build();
         let imp = row.imp();
+        imp.style.set(style);
         row.add_css_class("track-row");
 
         imp.number.set_width_chars(3);
@@ -98,6 +103,11 @@ impl TrackRow {
         imp.number.add_css_class("dim-label");
         imp.number.add_css_class("numeric");
         imp.number.set_visible(style == TrackStyle::Album);
+        imp.playing.set_icon_name(Some("audio-volume-high-symbolic"));
+        imp.playing.set_width_request(imp.number.width_chars() * 8);
+        imp.playing.set_halign(gtk::Align::End);
+        imp.playing.set_visible(false);
+        imp.playing.add_css_class("accent");
         imp.cover.set_size_request(40, 40);
         imp.cover.set_content_fit(gtk::ContentFit::Cover);
         imp.cover.set_can_shrink(true);
@@ -147,6 +157,7 @@ impl TrackRow {
         imp.menu.add_css_class("circular");
 
         row.append(&imp.number);
+        row.append(&imp.playing);
         row.append(&imp.cover);
         row.append(&text);
         row.append(&imp.hires);
@@ -233,6 +244,41 @@ impl TrackRow {
         }
         imp.item.replace(Some(item.clone()));
         self.sync_favorite();
+        self.sync_playing(style);
+    }
+
+    /// Mark the row as the one playing (as the queue does), or not.
+    fn sync_playing(&self, style: TrackStyle) {
+        let imp = self.imp();
+        let id = imp.item.borrow().as_ref().map(|t| t.data().id);
+        let playing = id.is_some() && id == self.root().and_downcast::<ZekeWindow>().and_then(|w| w.playing_id());
+        if playing {
+            imp.title.add_css_class("queue-current");
+        } else {
+            imp.title.remove_css_class("queue-current");
+        }
+        if style == TrackStyle::Album {
+            imp.number.set_visible(!playing);
+            imp.playing.set_visible(playing);
+        }
+    }
+}
+
+impl ZekeWindow {
+    /// The track the player is on, if any.
+    pub fn playing_id(&self) -> Option<u64> {
+        self.imp().now.borrow().as_ref().map(|n| n.track_id)
+    }
+
+    /// Re-mark the playing track in every live browse track list.
+    pub fn refresh_track_rows(&self) {
+        self.imp().track_rows.borrow_mut().retain(|row| {
+            let Some(row) = row.upgrade() else { return false };
+            if row.imp().item.borrow().is_some() {
+                row.sync_playing(row.imp().style.get());
+            }
+            true
+        });
     }
 }
 
@@ -291,9 +337,14 @@ pub fn track_list(
     on_play: impl Fn(u32) + 'static,
 ) -> gtk::ListView {
     let factory = gtk::SignalListItemFactory::new();
+    let w = window.downgrade();
     factory.connect_setup(move |_, item| {
         let item = item.downcast_ref::<gtk::ListItem>().expect("a ListItem");
-        item.set_child(Some(&TrackRow::new(style)));
+        let row = TrackRow::new(style);
+        if let Some(window) = w.upgrade() {
+            window.imp().track_rows.borrow_mut().push(row.downgrade());
+        }
+        item.set_child(Some(&row));
     });
     let covers = window.covers().clone();
     factory.connect_bind(move |_, item| {
