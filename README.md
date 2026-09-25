@@ -1,4 +1,8 @@
-# Zeke
+<h1 align="center">Zeke</h1>
+
+<p align="center">
+  <img src="data/icons/128/io.github.hcuadrado.Zeke.png" alt="Zeke icon" width="128" height="128">
+</p>
 
 A native Linux TIDAL player for hi-res lossless playback (up to 24-bit/192 kHz,
 bit-perfect through exclusive ALSA), written in Rust with GTK4 and libadwaita.

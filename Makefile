@@ -6,6 +6,7 @@ PREFIX ?= $(HOME)/.local
 BINDIR := $(PREFIX)/bin
 DATADIR := $(PREFIX)/share
 DESKTOP := target/$(APP_ID).desktop
+ICON_SIZES := 32 48 64 128 256 512
 
 .PHONY: all build desktop install uninstall validate
 
@@ -24,7 +25,11 @@ desktop:
 install: build desktop
 	install -Dm755 target/release/zeke $(DESTDIR)$(BINDIR)/zeke
 	install -Dm644 $(DESKTOP) $(DESTDIR)$(DATADIR)/applications/$(APP_ID).desktop
-	install -Dm644 data/$(APP_ID).svg $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/$(APP_ID).svg
+	for s in $(ICON_SIZES); do \
+		install -Dm644 data/icons/$$s/$(APP_ID).png $(DESTDIR)$(DATADIR)/icons/hicolor/$${s}x$$s/apps/$(APP_ID).png; \
+	done
+	# The icon was an SVG before; a leftover one would shadow the PNGs.
+	rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/$(APP_ID).svg
 	install -Dm644 data/$(APP_ID).metainfo.xml $(DESTDIR)$(DATADIR)/metainfo/$(APP_ID).metainfo.xml
 	-update-desktop-database -q $(DESTDIR)$(DATADIR)/applications
 	-gtk4-update-icon-cache -q -t -f $(DESTDIR)$(DATADIR)/icons/hicolor
@@ -32,6 +37,7 @@ install: build desktop
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/zeke
 	rm -f $(DESTDIR)$(DATADIR)/applications/$(APP_ID).desktop
+	for s in $(ICON_SIZES); do rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/$${s}x$$s/apps/$(APP_ID).png; done
 	rm -f $(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/$(APP_ID).svg
 	rm -f $(DESTDIR)$(DATADIR)/metainfo/$(APP_ID).metainfo.xml
 	-update-desktop-database -q $(DESTDIR)$(DATADIR)/applications
