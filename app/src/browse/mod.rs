@@ -398,10 +398,13 @@ impl ZekeWindow {
     /// Replace the queue with `tracks` and play `start` (with shuffle and
     /// no start, a random one). `album_mode`: one album in order, so album
     /// ReplayGain. `shuffle: None` keeps the shuffle toggle as it is.
-    pub fn play_tracks(&self, tracks: &[TrackData], start: Option<usize>, album_mode: bool, shuffle: Option<bool>) {
+    /// Returns the queue's generation, for `append_to_queue`.
+    pub fn play_tracks(&self, tracks: &[TrackData], start: Option<usize>, album_mode: bool, shuffle: Option<bool>) -> u64 {
+        let generation = &self.imp().queue_generation;
         if tracks.is_empty() {
-            return;
+            return generation.get();
         }
+        generation.set(generation.get() + 1);
         let shuffle = shuffle.unwrap_or_else(|| {
             self.lookup_action("shuffle").and_then(|a| a.state()).and_then(|s| s.get::<bool>()).unwrap_or(false)
         });
@@ -416,6 +419,19 @@ impl ZekeWindow {
             shuffle,
             repeat: self.imp().repeat.get(),
         });
+        generation.get()
+    }
+
+    /// Append the rest of a page to the queue `play_tracks` started, unless
+    /// another queue has replaced it since (then `false`).
+    pub fn append_to_queue(&self, generation: u64, tracks: &[TrackData]) -> bool {
+        if self.imp().queue_generation.get() != generation {
+            return false;
+        }
+        if !tracks.is_empty() {
+            self.send(PlayerCommand::Append(tracks.iter().map(TrackData::queue_track).collect()));
+        }
+        true
     }
 
     pub fn play_next(&self, track: &TrackData) {

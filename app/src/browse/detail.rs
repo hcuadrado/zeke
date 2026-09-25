@@ -197,7 +197,7 @@ async fn fetch(state: Arc<AppState>, source: Source, offset: u32) -> Result<Batc
     }
 }
 
-/// A queue waiting for the rest of the page.
+/// Play from this page: a row, or the Play / Shuffle buttons.
 #[derive(Debug, Clone, Copy)]
 struct PlayRequest {
     start: Option<usize>,
@@ -216,7 +216,10 @@ struct TrackPage {
     album_mode: bool,
     complete: Cell<bool>,
     total: Cell<Option<u32>>,
-    pending: RefCell<Option<PlayRequest>>,
+    /// A queue played from this page before all of it loaded: its
+    /// generation, and how many of the page's tracks it has. The rest is
+    /// appended as it arrives.
+    feeding: Cell<Option<(u64, usize)>>,
     /// Bumped by each (re)load; results of an older one are dropped.
     generation: Cell<u64>,
     /// When the first page was asked for, for the load-time log.
@@ -243,7 +246,7 @@ impl TrackPage {
             content: gtk::Box::builder().orientation(gtk::Orientation::Vertical).build(),
             complete: Cell::new(false),
             total: Cell::new(None),
-            pending: RefCell::default(),
+            feeding: Cell::new(None),
             generation: Cell::new(0),
             started: Cell::new(None),
             favorite: RefCell::default(),
@@ -287,7 +290,7 @@ impl TrackPage {
     fn reload(self: &Rc<Self>) {
         self.generation.set(self.generation.get() + 1);
         self.complete.set(false);
-        self.pending.take();
+        self.feeding.take();
         self.store.remove_all();
         self.started.set(Some(std::time::Instant::now()));
         self.shell.loading();
@@ -335,6 +338,12 @@ impl TrackPage {
         }
         let items: Vec<super::model::TrackObject> = batch.tracks.into_iter().map(super::model::TrackObject::new).collect();
         self.store.extend_from_slice(&items);
+        // Playable from the first page on; a queue started now gets the
+        // rest as it loads.
+        let has_tracks = self.store.n_items() > 0;
+        self.heading.play.set_sensitive(has_tracks);
+        self.heading.shuffle.set_sensitive(has_tracks);
+        self.feed();
         if offset == 0 {
             if self.store.n_items() == 0 && batch.next.is_none() {
                 self.shell.empty("No Tracks", "There is nothing here Zeke can play.");
@@ -390,9 +399,17 @@ impl TrackPage {
         if let Some(started) = self.started.take() {
             log::info!("[browse] {:?}: {} tracks in {:.2} s", self.source_name(), self.store.n_items(), started.elapsed().as_secs_f64());
         }
-        if let Some(request) = self.pending.take() {
-            self.play(request);
-        }
+        self.feed();
+        self.feeding.take();
+    }
+
+    /// Append what loaded since to a queue played from this page early,
+    /// while it is still the player's queue.
+    fn feed(&self) {
+        let (Some((generation, sent)), Some(window)) = (self.feeding.get(), self.window()) else { return };
+        let tracks = views::tracks_of(&self.store);
+        let fed = window.append_to_queue(generation, tracks.get(sent..).unwrap_or_default());
+        self.feeding.set(fed.then_some((generation, tracks.len())));
     }
 
     fn source_name(&self) -> String {
@@ -405,16 +422,16 @@ impl TrackPage {
         }
     }
 
+    /// Play what has loaded; while the page is still loading, the rest
+    /// joins the queue as it comes (shuffled in, when shuffling).
     fn play(&self, request: PlayRequest) {
         let Some(window) = self.window() else { return };
-        if !self.complete.get() {
-            if self.pending.replace(Some(request)).is_none() {
-                window.toast("Loading the rest of the tracks first…");
-            }
+        let tracks = views::tracks_of(&self.store);
+        if tracks.is_empty() {
             return;
         }
-        let tracks = views::tracks_of(&self.store);
-        window.play_tracks(&tracks, request.start, self.album_mode, request.shuffle);
+        let generation = window.play_tracks(&tracks, request.start, self.album_mode, request.shuffle);
+        self.feeding.set((!self.complete.get()).then_some((generation, tracks.len())));
     }
 }
 

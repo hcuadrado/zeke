@@ -144,6 +144,9 @@ mod imp {
         pub now_hearts: RefCell<crate::hearts::Redraws>,
         /// Browse track rows, to re-mark the playing track on a change.
         pub track_rows: RefCell<Vec<glib::WeakRef<crate::browse::views::TrackRow>>>,
+        /// Bumped whenever the queue is replaced: a page still loading the
+        /// queue it started appends the rest only while this is unchanged.
+        pub queue_generation: Cell<u64>,
     }
 
     #[glib::object_subclass]

@@ -193,6 +193,8 @@ impl ZekeWindow {
 
     /// Stop playback and empty the queue (the saved one too).
     pub fn clear_queue(&self) {
+        let generation = &self.imp().queue_generation;
+        generation.set(generation.get() + 1);
         self.send(PlayerCommand::Load {
             tracks: Vec::new(),
             start: None,
