@@ -10,7 +10,7 @@ use gtk::{gio, glib};
 use zeke_player::{PlaybackState, PlayerCommand, QueueItem, RepeatMode};
 use zeke_tidal::commands::browse::Favorite;
 
-use crate::badge::quality_badge;
+use crate::badge::{quality_badge, resampled, signal_path_rows, source_label};
 use crate::covers;
 use crate::queue_row::{format_time, QueueRow};
 use crate::window::ZekeWindow;
@@ -36,6 +36,16 @@ impl ZekeWindow {
                 }
             ));
         }
+
+        // The title and artist open the sheet, as the cover does.
+        let click = gtk::GestureClick::new();
+        click.connect_released(glib::clone!(
+            #[weak(rename_to = window)]
+            self,
+            move |_, _, _, _| window.imp().sheet.set_open(true)
+        ));
+        imp.bar_track_labels.add_controller(click);
+        imp.bar_track_labels.set_cursor_from_name(Some("pointer"));
 
         imp.bar_volume.set_value(f64::from(self.session().settings().volume));
         imp.bar_volume.connect_value_changed(glib::clone!(
@@ -177,11 +187,43 @@ impl ZekeWindow {
 
     pub fn refresh_badge(&self) {
         let imp = self.imp();
-        let format = imp.now.borrow().as_ref().and_then(|n| n.format.clone());
-        let badge = format.and_then(|f| quality_badge(&f, imp.signal_path.borrow().as_deref()));
-        for label in [&*imp.bar_badge, &*imp.sheet_badge] {
-            label.set_visible(badge.is_some());
-            label.set_label(badge.as_deref().unwrap_or(""));
+        let format = imp.now.borrow().as_ref().and_then(|n| n.format.clone()).unwrap_or_default();
+        let path = imp.signal_path.borrow();
+        let path = path.as_deref();
+
+        // The sheet has room for the whole thing.
+        let badge = quality_badge(&format, path);
+        imp.sheet_badge.set_visible(badge.is_some());
+        imp.sheet_badge.set_label(badge.as_deref().unwrap_or(""));
+
+        // The bar: the source, a dot for resampled or not, the rest on click.
+        let source = source_label(&format);
+        imp.bar_badge.set_opacity(if source.is_some() { 1.0 } else { 0.0 });
+        imp.bar_badge.set_sensitive(source.is_some());
+        imp.bar_badge_label.set_label(source.as_deref().unwrap_or(""));
+        let resampled = resampled(&format, path);
+        let dot = &imp.bar_rate_dot;
+        dot.set_visible(resampled.is_some());
+        dot.set_css_classes(match resampled {
+            Some(true) => &["rate-dot", "resampled"],
+            _ => &["rate-dot", "unchanged"],
+        });
+        let hint = match resampled {
+            Some(true) => "Resampled on the way out",
+            Some(false) => "Plays at the source rate",
+            None => "Stream format",
+        };
+        imp.bar_badge.set_tooltip_text(badge.map(|b| format!("{b}\n{hint}")).as_deref());
+
+        let grid = &imp.bar_path_grid;
+        while let Some(child) = grid.first_child() {
+            grid.remove(&child);
+        }
+        for (row, (step, detail)) in (0..).zip(signal_path_rows(&format, path)) {
+            let step = gtk::Label::builder().label(step).xalign(0.0).css_classes(["dim-label"]).build();
+            let detail = gtk::Label::builder().label(detail).xalign(0.0).selectable(true).build();
+            grid.attach(&step, 0, row, 1, 1);
+            grid.attach(&detail, 1, row, 1, 1);
         }
     }
 

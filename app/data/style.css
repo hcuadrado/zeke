@@ -5,13 +5,34 @@
   background-color: alpha(currentColor, 0.08);
 }
 
+/* Quality badge: dimmed like the artist line, fixed-width digits so it
+   doesn't shift between tracks. The sheet's is a label, the bar's a flat menu button. */
 .quality-badge {
   font-size: 0.8em;
   font-weight: bold;
+  font-feature-settings: "tnum";
+}
+
+label.quality-badge,
+menubutton.quality-badge > button {
+  min-height: 0;
   padding: 2px 8px;
   border-radius: 999px;
-  background-color: alpha(var(--accent-bg-color), 0.15);
-  color: var(--accent-color);
+  box-shadow: inset 0 0 0 1px alpha(currentColor, 0.2);
+}
+
+.rate-dot {
+  min-width: 6px;
+  min-height: 6px;
+  border-radius: 999px;
+}
+
+.rate-dot.unchanged {
+  background-color: var(--success-color);
+}
+
+.rate-dot.resampled {
+  background-color: var(--warning-color);
 }
 
 .queue-current {

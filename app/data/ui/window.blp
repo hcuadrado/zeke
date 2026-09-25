@@ -364,6 +364,7 @@ template $ZekeWindow: Adw.ApplicationWindow {
 
                       styles [
                         "quality-badge",
+                        "dim-label",
                       ]
                     }
 
@@ -524,34 +525,52 @@ template $ZekeWindow: Adw.ApplicationWindow {
             margin-end: 6;
 
             start-widget: Box {
-              spacing: 2;
+              spacing: 6;
 
               Button bar_track_button {
-              tooltip-text: "Show Now Playing";
-              clicked => $on_open_sheet() swapped;
+                tooltip-text: "Show Now Playing";
+                clicked => $on_open_sheet() swapped;
 
-              styles [
-                "flat",
-              ]
+                styles [
+                  "flat",
+                ]
 
-              child: Box {
-                spacing: 10;
-
-                Picture bar_cover {
-                  width-request: 48;
-                  height-request: 48;
-                  content-fit: cover;
-                  can-shrink: true;
-
-                  styles [
-                    "cover",
-                  ]
-                }
-
-                Box {
-                  orientation: vertical;
+                // A Picture's natural size is its texture's (160px here), so
+                // the clamps cap it: the bar keeps one height across covers.
+                child: Adw.Clamp {
+                  maximum-size: 64;
+                  tightening-threshold: 64;
                   valign: center;
-                  width-request: 140;
+
+                  child: Adw.Clamp {
+                    orientation: vertical;
+                    maximum-size: 64;
+                    tightening-threshold: 64;
+
+                    child: Picture bar_cover {
+                      width-request: 64;
+                      height-request: 64;
+                      content-fit: cover;
+                      can-shrink: true;
+
+                      styles [
+                        "cover",
+                      ]
+                    };
+                  };
+                };
+              }
+
+              Box {
+                orientation: vertical;
+                valign: center;
+                width-request: 140;
+
+                // Opens the sheet too, by a click gesture set up in code: the
+                // badge below is a button of its own, so no button wraps both.
+                Box bar_track_labels {
+                  orientation: vertical;
+                  tooltip-text: "Show Now Playing";
 
                   Label bar_title {
                     label: "Nothing playing";
@@ -574,7 +593,65 @@ template $ZekeWindow: Adw.ApplicationWindow {
                     ]
                   }
                 }
-              };
+
+                // Always takes its room, so the title and artist don't jump
+                // when a track starts; hidden by opacity until then.
+                MenuButton bar_badge {
+                  opacity: 0;
+                  sensitive: false;
+                  halign: start;
+                  margin-top: 4;
+
+                  styles [
+                    "flat",
+                    "quality-badge",
+                  ]
+
+                  child: Box {
+                    spacing: 6;
+
+                    // Green: the device plays the source rate; amber: resampled.
+                    Box bar_rate_dot {
+                      valign: center;
+                      visible: false;
+
+                      styles [
+                        "rate-dot",
+                      ]
+                    }
+
+                    Label bar_badge_label {
+                      styles [
+                        "dim-label",
+                      ]
+                    }
+                  };
+
+                  popover: Popover {
+                    child: Box {
+                      orientation: vertical;
+                      spacing: 10;
+                      margin-top: 6;
+                      margin-bottom: 6;
+                      margin-start: 6;
+                      margin-end: 6;
+
+                      Label {
+                        label: "Signal Path";
+                        xalign: 0;
+
+                        styles [
+                          "heading",
+                        ]
+                      }
+
+                      Grid bar_path_grid {
+                        row-spacing: 6;
+                        column-spacing: 18;
+                      }
+                    };
+                  };
+                }
               }
 
               Button bar_heart {
@@ -670,15 +747,6 @@ template $ZekeWindow: Adw.ApplicationWindow {
             end-widget: Box bar_end {
               spacing: 6;
               valign: center;
-
-              Label bar_badge {
-                visible: false;
-                tooltip-text: "Stream format, and the rate the output plays it at";
-
-                styles [
-                  "quality-badge",
-                ]
-              }
 
               Image {
                 icon-name: "audio-volume-high-symbolic";

@@ -95,7 +95,15 @@ mod imp {
         #[template_child]
         pub bar_play: TemplateChild<gtk::Button>,
         #[template_child]
-        pub bar_badge: TemplateChild<gtk::Label>,
+        pub bar_badge: TemplateChild<gtk::MenuButton>,
+        #[template_child]
+        pub bar_track_labels: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub bar_badge_label: TemplateChild<gtk::Label>,
+        #[template_child]
+        pub bar_rate_dot: TemplateChild<gtk::Box>,
+        #[template_child]
+        pub bar_path_grid: TemplateChild<gtk::Grid>,
         #[template_child]
         pub bar_volume: TemplateChild<gtk::Scale>,
         #[template_child]
