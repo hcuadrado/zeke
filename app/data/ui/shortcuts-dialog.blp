@@ -1,0 +1,49 @@
+using Gtk 4.0;
+using Adw 1;
+
+// AdwApplication loads this from the resource base path as
+// `shortcuts-dialog.ui` and opens it with app.shortcuts (Ctrl+?).
+Adw.ShortcutsDialog shortcuts_dialog {
+  Adw.ShortcutsSection {
+    title: "Playback";
+
+    Adw.ShortcutsItem {
+      title: "Play or pause";
+      accelerator: "space";
+    }
+
+    Adw.ShortcutsItem {
+      title: "Next track";
+      accelerator: "<Control>Right";
+    }
+
+    Adw.ShortcutsItem {
+      title: "Previous track";
+      accelerator: "<Control>Left";
+    }
+  }
+
+  Adw.ShortcutsSection {
+    title: "General";
+
+    Adw.ShortcutsItem {
+      title: "Search";
+      accelerator: "<Control>f";
+    }
+
+    Adw.ShortcutsItem {
+      title: "Preferences";
+      accelerator: "<Control>comma";
+    }
+
+    Adw.ShortcutsItem {
+      title: "Keyboard shortcuts";
+      accelerator: "<Control>question";
+    }
+
+    Adw.ShortcutsItem {
+      title: "Quit";
+      accelerator: "<Control>q";
+    }
+  }
+}

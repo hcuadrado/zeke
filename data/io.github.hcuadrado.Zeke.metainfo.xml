@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Copyright 2026 H. Cuadrado -->
+<component type="desktop-application">
+  <id>io.github.hcuadrado.Zeke</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+
+  <name>Zeke</name>
+  <summary>Play TIDAL in hi-res lossless</summary>
+  <description>
+    <p>
+      Zeke is a native TIDAL player for Linux, built for hi-res lossless
+      playback (up to 24-bit/192 kHz FLAC). It plays through ALSA in
+      exclusive mode, bit-perfect when the output device takes the track’s
+      rate and with one high-quality resample when it doesn’t, and it is
+      gapless across tracks in every mode.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Home feed, search, favorites, and album, playlist, artist and mix pages</li>
+      <li>A queue that is saved and comes back where you left it</li>
+      <li>Shuffle, repeat, ReplayGain and a quality badge for the stream</li>
+      <li>Media keys and desktop integration through MPRIS</li>
+    </ul>
+    <p>A TIDAL subscription is required.</p>
+  </description>
+
+  <developer id="io.github.hcuadrado">
+    <name>H. Cuadrado</name>
+  </developer>
+
+  <url type="homepage">https://github.com/hcuadrado/zeke</url>
+
+  <launchable type="desktop-id">io.github.hcuadrado.Zeke.desktop</launchable>
+  <provides>
+    <binary>zeke</binary>
+  </provides>
+
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+  </categories>
+  <keywords>
+    <keyword>TIDAL</keyword>
+    <keyword>hi-res</keyword>
+    <keyword>lossless</keyword>
+    <keyword>FLAC</keyword>
+  </keywords>
+
+  <requires>
+    <display_length compare="ge">360</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+  </supports>
+
+  <content_rating type="oars-1.1"/>
+
+  <releases>
+    <release version="0.1.0" date="2026-09-25">
+      <description>
+        <p>
+          The first version: TIDAL login, browsing, hi-res gapless playback,
+          a saved queue, favorites and keyboard shortcuts.
+        </p>
+      </description>
+    </release>
+  </releases>
+</component>

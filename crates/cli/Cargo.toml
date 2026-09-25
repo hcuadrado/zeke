@@ -1,0 +1,16 @@
+[package]
+name = "zeke-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-channel = "2"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
+zeke-engine = { path = "../engine" }
+zeke-player = { path = "../player" }
+zeke-tidal = { path = "../tidal" }

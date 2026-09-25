@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Zeke
+GenericName=Music Player
+Comment=Play TIDAL in hi-res lossless
+Exec=@BINDIR@/zeke
+Icon=io.github.hcuadrado.Zeke
+Terminal=false
+Categories=AudioVideo;Audio;Player;GTK;
+Keywords=TIDAL;music;hi-res;lossless;FLAC;player;
+StartupNotify=true
+SingleMainWindow=true

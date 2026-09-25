@@ -1,0 +1,34 @@
+Zeke
+Copyright (C) 2026 The Zeke authors
+
+Zeke is free software, licensed under the GNU General Public License,
+version 3 (see LICENSE).
+
+Zeke includes code derived from SONE:
+  Project:  SONE
+  Source:   https://github.com/lullabyX/sone
+  License:  GPL-3.0
+  Commit:   08ef1d5
+
+Files derived from SONE, with the SONE path each one came from
+(src-tauri/src/ unless noted):
+
+crates/tidal/src/tidal_api.rs          tidal_api.rs
+crates/tidal/src/cache.rs              cache.rs
+crates/tidal/src/crypto.rs             crypto.rs (keyring service, key file
+                                       and file magic renamed to zeke)
+crates/tidal/src/rate_gate.rs          rate_gate.rs
+crates/tidal/src/error.rs              error.rs
+crates/tidal/src/embedded_config.rs    embedded_config.rs
+crates/tidal/src/lib.rs                lib.rs (Settings, AuthMethod, proxy
+                                       settings types, persistence)
+crates/tidal/src/util.rs               lib.rs (now_secs)
+crates/tidal/src/proxy.rs              proxy.rs (reduced to a stub)
+crates/tidal/src/proxy_http.rs         proxy_http.rs (reduced to a stub)
+crates/tidal/src/commands/auth.rs      commands/auth.rs, and
+                                       src/components/Login.tsx (code extraction)
+crates/tidal/src/commands/playback.rs  commands/playback.rs
+crates/tidal/src/commands/pages.rs     commands/pages.rs
+crates/engine/src/audio.rs             audio.rs
+crates/engine/src/signal_path.rs       signal_path.rs
+crates/engine/src/pipeline_probe.rs    pipeline_probe.rs

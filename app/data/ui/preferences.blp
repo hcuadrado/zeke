@@ -1,0 +1,73 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $ZekePreferences: Adw.PreferencesDialog {
+  Adw.PreferencesPage {
+    title: "Audio";
+    icon-name: "audio-speakers-symbolic";
+
+    Adw.PreferencesGroup {
+      title: "Quality";
+
+      Adw.ComboRow quality_row {
+        title: "Streaming quality";
+        subtitle: "The highest quality to ask TIDAL for";
+      }
+    }
+
+    Adw.PreferencesGroup {
+      title: "Output";
+      description: "Changes apply from the next track.";
+
+      Adw.SwitchRow exclusive_row {
+        title: "Exclusive mode";
+        subtitle: "Play straight to the ALSA device, resampling once in Zeke. Other apps are silent while Zeke holds the device.";
+      }
+
+      Adw.ComboRow device_row {
+        title: "Device";
+        // The selection as the subtitle, where it has room to be read.
+        use-subtitle: true;
+        sensitive: bind exclusive_row.active;
+      }
+
+      Adw.SwitchRow bit_perfect_row {
+        title: "Bit-perfect";
+        subtitle: "No resampling or conversion. Tracks at a rate the device lacks don’t play.";
+        sensitive: bind exclusive_row.active;
+      }
+    }
+
+    Adw.PreferencesGroup {
+      title: "Playback";
+
+      Adw.SwitchRow gapless_row {
+        title: "Gapless playback";
+      }
+
+      Adw.SwitchRow normalization_row {
+        title: "ReplayGain";
+        subtitle: "Even out loudness: album gain for an album in order, track gain otherwise";
+      }
+    }
+  }
+
+  Adw.PreferencesPage {
+    title: "Appearance";
+    icon-name: "applications-graphics-symbolic";
+
+    Adw.PreferencesGroup {
+      Adw.ComboRow color_scheme_row {
+        title: "Style";
+
+        model: StringList {
+          strings [
+            "Follow System",
+            "Light",
+            "Dark",
+          ]
+        };
+      }
+    }
+  }
+}

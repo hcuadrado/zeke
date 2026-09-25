@@ -1,0 +1,26 @@
+[package]
+name = "zeke"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+async-channel = "2"
+# libadwaita 1.6 requires GTK 4.15+, so this costs nothing.
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+log = "0.4"
+# zbus on async-io, on its own thread (see mpris.rs).
+mpris-server = "0.9"
+# Covers only, never through the TIDAL client.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+serde = "1"
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "rt", "signal", "sync", "time", "macros"] }
+zeke-engine = { path = "../crates/engine" }
+zeke-player = { path = "../crates/player" }
+zeke-tidal = { path = "../crates/tidal" }
+
+[build-dependencies]
+glib-build-tools = "0.22"

@@ -1,0 +1,702 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $ZekeWindow: Adw.ApplicationWindow {
+  title: "Zeke";
+  default-width: 1100;
+  default-height: 720;
+  width-request: 360;
+  height-request: 294;
+
+  Adw.Breakpoint {
+    condition ("max-width: 600sp")
+
+    setters {
+      split_view.collapsed: true;
+      now_playing_box.orientation: vertical;
+      bar_end.visible: false;
+    }
+  }
+
+  content: Adw.ToastOverlay toast_overlay {
+    child: Stack stack {
+      transition-type: crossfade;
+
+      StackPage {
+        name: "login";
+
+        child: Adw.ToolbarView {
+          [top]
+          Adw.HeaderBar {}
+
+          content: Adw.StatusPage {
+            icon-name: "audio-x-generic-symbolic";
+            title: "Sign in to TIDAL";
+            description: "Zeke opens TIDAL’s login page in your browser. After signing in, copy the address of the page you land on (it starts with https://tidal.com/android/login/auth?code=) and paste it below.";
+
+            child: Box {
+              orientation: vertical;
+              spacing: 18;
+              halign: center;
+              width-request: 360;
+
+              Button open_login_button {
+                label: "Open TIDAL Login";
+                halign: center;
+                clicked => $on_open_login() swapped;
+
+                styles [
+                  "pill",
+                  "suggested-action",
+                ]
+              }
+
+              ListBox {
+                selection-mode: none;
+
+                styles [
+                  "boxed-list",
+                ]
+
+                Adw.EntryRow login_entry {
+                  title: "Redirect address or code";
+                  sensitive: false;
+                  show-apply-button: true;
+                  apply => $on_login_apply() swapped;
+                  entry-activated => $on_login_apply() swapped;
+                }
+              }
+
+              Adw.Spinner login_spinner {
+                visible: false;
+                halign: center;
+              }
+            };
+          };
+        };
+      }
+
+      StackPage {
+        name: "main";
+
+        child: Adw.ToolbarView main_view {
+          bottom-bar-style: raised;
+          reveal-bottom-bars: bind sheet.open inverted;
+
+          content: Adw.BottomSheet sheet {
+            show-drag-handle: true;
+
+            content: Adw.NavigationSplitView split_view {
+              sidebar: Adw.NavigationPage {
+                title: "Zeke";
+
+                child: Adw.ToolbarView {
+                  [top]
+                  Adw.HeaderBar {
+                    [end]
+                    MenuButton {
+                      primary: true;
+                      icon-name: "open-menu-symbolic";
+                      tooltip-text: "Main Menu";
+                      menu-model: primary_menu;
+                    }
+                  }
+
+                  content: ScrolledWindow {
+                    hscrollbar-policy: never;
+
+                    child: ListBox sidebar_list {
+                      selection-mode: single;
+
+                      styles [
+                        "navigation-sidebar",
+                      ]
+
+                      ListBoxRow {
+                        name: "home";
+
+                        child: Box {
+                          spacing: 12;
+
+                          Image {
+                            icon-name: "go-home-symbolic";
+                          }
+
+                          Label {
+                            label: "Home";
+                            xalign: 0;
+                          }
+                        };
+                      }
+
+                      ListBoxRow {
+                        name: "search";
+
+                        child: Box {
+                          spacing: 12;
+
+                          Image {
+                            icon-name: "system-search-symbolic";
+                          }
+
+                          Label {
+                            label: "Search";
+                            xalign: 0;
+                          }
+                        };
+                      }
+
+                      ListBoxRow {
+                        activatable: false;
+                        selectable: false;
+
+                        child: Label {
+                          label: "Favorites";
+                          xalign: 0;
+                          margin-top: 12;
+
+                          styles [
+                            "heading",
+                            "dim-label",
+                          ]
+                        };
+                      }
+
+                      ListBoxRow {
+                        name: "fav-tracks";
+
+                        child: Box {
+                          spacing: 12;
+
+                          Image {
+                            icon-name: "heart-filled-symbolic";
+                          }
+
+                          Label {
+                            label: "Tracks";
+                            xalign: 0;
+                          }
+                        };
+                      }
+
+                      ListBoxRow {
+                        name: "fav-albums";
+
+                        child: Box {
+                          spacing: 12;
+
+                          Image {
+                            icon-name: "media-optical-symbolic";
+                          }
+
+                          Label {
+                            label: "Albums";
+                            xalign: 0;
+                          }
+                        };
+                      }
+
+                      ListBoxRow {
+                        name: "fav-artists";
+
+                        child: Box {
+                          spacing: 12;
+
+                          Image {
+                            icon-name: "avatar-default-symbolic";
+                          }
+
+                          Label {
+                            label: "Artists";
+                            xalign: 0;
+                          }
+                        };
+                      }
+
+                      ListBoxRow {
+                        name: "fav-playlists";
+
+                        child: Box {
+                          spacing: 12;
+
+                          Image {
+                            icon-name: "view-list-symbolic";
+                          }
+
+                          Label {
+                            label: "Playlists";
+                            xalign: 0;
+                          }
+                        };
+                      }
+                    };
+                  };
+                };
+              };
+
+              // Browse pages push onto this; the sidebar replaces its root.
+              content: Adw.NavigationPage {
+                title: "Zeke";
+
+                child: Adw.NavigationView nav_view {};
+              };
+            };
+
+            sheet: ScrolledWindow {
+              hscrollbar-policy: never;
+              propagate-natural-height: true;
+
+              child: Box now_playing_box {
+                orientation: horizontal;
+                spacing: 24;
+                margin-top: 12;
+                margin-bottom: 24;
+                margin-start: 24;
+                margin-end: 24;
+
+                // Wide: a fixed column, so the queue takes the rest of the
+                // width and its titles fit. Narrow: stacked, full width.
+                Box {
+                  orientation: vertical;
+                  spacing: 12;
+                  width-request: 300;
+                  valign: start;
+
+                  Picture sheet_cover {
+                    width-request: 280;
+                    height-request: 280;
+                    halign: center;
+                    content-fit: cover;
+                    can-shrink: true;
+
+                    styles [
+                      "cover",
+                    ]
+                  }
+
+                  Label sheet_title {
+                    wrap: true;
+                    justify: center;
+
+                    styles [
+                      "title-2",
+                    ]
+                  }
+
+                  Label sheet_artist {
+                    wrap: true;
+                    justify: center;
+                  }
+
+                  Label sheet_album {
+                    wrap: true;
+                    justify: center;
+
+                    styles [
+                      "dim-label",
+                    ]
+                  }
+
+                  Box {
+                    spacing: 8;
+                    halign: center;
+
+                    Label sheet_badge {
+                      valign: center;
+                      visible: false;
+
+                      styles [
+                        "quality-badge",
+                      ]
+                    }
+
+                    Button sheet_heart {
+                      icon-name: "heart-outline-symbolic";
+                      valign: center;
+                      visible: false;
+
+                      styles [
+                        "flat",
+                        "circular",
+                        "heart",
+                      ]
+                    }
+                  }
+
+                  Box {
+                    spacing: 8;
+
+                    Label sheet_elapsed {
+                      label: "0:00";
+                      width-chars: 5;
+
+                      styles [
+                        "numeric",
+                        "dim-label",
+                      ]
+                    }
+
+                    Scale sheet_seek {
+                      hexpand: true;
+                      adjustment: Adjustment {
+                        lower: 0;
+                        upper: 1;
+                      };
+                    }
+
+                    Label sheet_total {
+                      label: "0:00";
+                      width-chars: 5;
+
+                      styles [
+                        "numeric",
+                        "dim-label",
+                      ]
+                    }
+                  }
+
+                  Box {
+                    spacing: 12;
+                    halign: center;
+
+                    ToggleButton {
+                      icon-name: "media-playlist-shuffle-symbolic";
+                      tooltip-text: "Shuffle";
+                      action-name: "win.shuffle";
+                      valign: center;
+
+                      styles [
+                        "flat",
+                        "circular",
+                      ]
+                    }
+
+                    Button {
+                      icon-name: "media-skip-backward-symbolic";
+                      tooltip-text: "Previous";
+                      action-name: "win.previous";
+                      valign: center;
+
+                      styles [
+                        "flat",
+                        "circular",
+                      ]
+                    }
+
+                    Button sheet_play {
+                      icon-name: "media-playback-start-symbolic";
+                      tooltip-text: "Play";
+                      action-name: "win.play-pause";
+                      width-request: 56;
+                      height-request: 56;
+
+                      styles [
+                        "circular",
+                        "suggested-action",
+                      ]
+                    }
+
+                    Button {
+                      icon-name: "media-skip-forward-symbolic";
+                      tooltip-text: "Next";
+                      action-name: "win.next";
+                      valign: center;
+
+                      styles [
+                        "flat",
+                        "circular",
+                      ]
+                    }
+
+                    Button sheet_repeat {
+                      icon-name: "media-playlist-repeat-symbolic";
+                      tooltip-text: "Repeat: off";
+                      action-name: "win.cycle-repeat";
+                      valign: center;
+
+                      styles [
+                        "flat",
+                        "circular",
+                      ]
+                    }
+                  }
+                }
+
+                Box {
+                  orientation: vertical;
+                  spacing: 6;
+                  hexpand: true;
+
+                  Label {
+                    label: "Queue";
+                    xalign: 0;
+
+                    styles [
+                      "heading",
+                    ]
+                  }
+
+                  ScrolledWindow {
+                    hscrollbar-policy: never;
+                    vexpand: true;
+                    min-content-height: 320;
+
+                    child: ListView queue_view {
+                      single-click-activate: true;
+                      activate => $on_queue_activate() swapped;
+
+                      styles [
+                        "navigation-sidebar",
+                      ]
+                    };
+
+                    styles [
+                      "card",
+                    ]
+                  }
+                }
+              };
+            };
+          };
+
+          [bottom]
+          CenterBox player_bar {
+            margin-top: 6;
+            margin-bottom: 6;
+            margin-start: 6;
+            margin-end: 6;
+
+            start-widget: Box {
+              spacing: 2;
+
+              Button bar_track_button {
+              tooltip-text: "Show Now Playing";
+              clicked => $on_open_sheet() swapped;
+
+              styles [
+                "flat",
+              ]
+
+              child: Box {
+                spacing: 10;
+
+                Picture bar_cover {
+                  width-request: 48;
+                  height-request: 48;
+                  content-fit: cover;
+                  can-shrink: true;
+
+                  styles [
+                    "cover",
+                  ]
+                }
+
+                Box {
+                  orientation: vertical;
+                  valign: center;
+                  width-request: 140;
+
+                  Label bar_title {
+                    label: "Nothing playing";
+                    xalign: 0;
+                    ellipsize: end;
+                    max-width-chars: 28;
+
+                    styles [
+                      "heading",
+                    ]
+                  }
+
+                  Label bar_artist {
+                    xalign: 0;
+                    ellipsize: end;
+                    max-width-chars: 28;
+
+                    styles [
+                      "dim-label",
+                    ]
+                  }
+                }
+              };
+              }
+
+              Button bar_heart {
+                icon-name: "heart-outline-symbolic";
+                valign: center;
+                visible: false;
+
+                styles [
+                  "flat",
+                  "circular",
+                  "heart",
+                ]
+              }
+            };
+
+            center-widget: Box {
+              orientation: vertical;
+              spacing: 2;
+              width-request: 320;
+
+              Box {
+                spacing: 6;
+                halign: center;
+
+                Button {
+                  icon-name: "media-skip-backward-symbolic";
+                  tooltip-text: "Previous";
+                  action-name: "win.previous";
+
+                  styles [
+                    "flat",
+                    "circular",
+                  ]
+                }
+
+                Button bar_play {
+                  icon-name: "media-playback-start-symbolic";
+                  tooltip-text: "Play";
+                  action-name: "win.play-pause";
+
+                  styles [
+                    "circular",
+                  ]
+                }
+
+                Button {
+                  icon-name: "media-skip-forward-symbolic";
+                  tooltip-text: "Next";
+                  action-name: "win.next";
+
+                  styles [
+                    "flat",
+                    "circular",
+                  ]
+                }
+              }
+
+              Box {
+                spacing: 6;
+
+                Label bar_elapsed {
+                  label: "0:00";
+                  width-chars: 5;
+
+                  styles [
+                    "numeric",
+                    "caption",
+                    "dim-label",
+                  ]
+                }
+
+                Scale bar_seek {
+                  hexpand: true;
+                  adjustment: Adjustment {
+                    lower: 0;
+                    upper: 1;
+                  };
+                }
+
+                Label bar_total {
+                  label: "0:00";
+                  width-chars: 5;
+
+                  styles [
+                    "numeric",
+                    "caption",
+                    "dim-label",
+                  ]
+                }
+              }
+            };
+
+            end-widget: Box bar_end {
+              spacing: 6;
+              valign: center;
+
+              Label bar_badge {
+                visible: false;
+                tooltip-text: "Stream format, and the rate the output plays it at";
+
+                styles [
+                  "quality-badge",
+                ]
+              }
+
+              Image {
+                icon-name: "audio-volume-high-symbolic";
+              }
+
+              Scale bar_volume {
+                width-request: 100;
+                adjustment: Adjustment {
+                  lower: 0;
+                  upper: 1;
+                  step-increment: 0.05;
+                  page-increment: 0.1;
+                };
+              }
+
+              Button {
+                icon-name: "go-up-symbolic";
+                tooltip-text: "Show Now Playing";
+                clicked => $on_open_sheet() swapped;
+
+                styles [
+                  "flat",
+                  "circular",
+                ]
+              }
+            };
+          }
+        };
+      }
+    };
+  };
+}
+
+menu primary_menu {
+  section {
+    label: "Style";
+
+    item {
+      label: "System";
+      action: "app.color-scheme";
+      target: "system";
+    }
+
+    item {
+      label: "Light";
+      action: "app.color-scheme";
+      target: "light";
+    }
+
+    item {
+      label: "Dark";
+      action: "app.color-scheme";
+      target: "dark";
+    }
+  }
+
+  section {
+    item {
+      label: "Preferences";
+      action: "win.preferences";
+    }
+
+    item {
+      label: "Keyboard Shortcuts";
+      action: "app.shortcuts";
+    }
+
+    item {
+      label: "Log Out";
+      action: "win.logout";
+    }
+
+    item {
+      label: "Quit";
+      action: "app.quit";
+    }
+  }
+}

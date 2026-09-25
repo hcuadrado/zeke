@@ -1,0 +1,31 @@
+[package]
+name = "zeke-tidal"
+version.workspace = true
+# Edition 2021: 2024 changes `if let` temporary drop order, which this code relies on.
+edition = "2021"
+license.workspace = true
+publish = false
+
+[dependencies]
+aes-gcm = "0.10"
+base64 = "0.21"
+dirs = "5"
+# Only for tidal_api.rs profile-picture upload (unused by the app; kept so the file stays whole).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+# zbus on async-io: its blocking calls then work from inside a tokio runtime.
+keyring = { version = "3", features = ["async-secret-service", "async-io", "crypto-rust"] }
+log = { version = "0.4", features = ["std"] }
+md5 = "0.7"
+rand = "0.10"
+regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "rt", "macros", "time"] }
+url = "2"
+zeroize = "1"
+
+[dev-dependencies]
+tempfile = "3"
