@@ -360,10 +360,7 @@ impl ZekeWindow {
             UiEvent::Error(e) => self.toast(&e),
             UiEvent::LoginExpired => self.login_expired(),
             UiEvent::Notice(n) => self.toast(&n),
-            UiEvent::DeviceChosen(device) => {
-                log::info!("[app] using {device} for exclusive mode");
-                self.session().device_chosen(device);
-            }
+            UiEvent::OutputReset(device) => self.session().output_reset(&device),
             UiEvent::Raise => self.present(),
             UiEvent::Quit => {
                 if let Some(app) = self.application() {
