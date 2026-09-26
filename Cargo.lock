@@ -3433,6 +3433,7 @@ dependencies = [
  "zeke-engine",
  "zeke-player",
  "zeke-plugin",
+ "zeke-plugin-cast",
  "zeke-tidal",
 ]
 
@@ -3488,6 +3489,17 @@ dependencies = [
  "gtk4",
  "tokio",
  "zeke-tidal",
+]
+
+[[package]]
+name = "zeke-plugin-cast"
+version = "0.2.0"
+dependencies = [
+ "gtk4",
+ "libadwaita",
+ "log",
+ "tokio",
+ "zeke-plugin",
 ]
 
 [[package]]

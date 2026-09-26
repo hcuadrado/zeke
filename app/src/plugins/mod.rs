@@ -22,7 +22,10 @@ use runner::{Account, Action, Event, Runner};
 
 /// Every plugin this build has.
 fn registry() -> Vec<Arc<dyn DynPlugin>> {
-    Vec::new()
+    vec![
+        #[cfg(feature = "cast")]
+        Arc::new(zeke_plugin_cast::Cast),
+    ]
 }
 
 /// How long quitting waits for the plugins to stop.
@@ -305,5 +308,11 @@ mod tests {
     fn the_credential_goes_only_to_a_plugin_that_needs_it() {
         assert_eq!(grant(&[Need::Credential], Need::Credential, || "token"), Some("token"));
         assert_eq!(grant(&[], Need::Credential, || -> &str { panic!("not asked for") }), None);
+    }
+
+    #[test]
+    fn this_build_has_the_plugins_its_features_name() {
+        let ids: Vec<_> = registry().iter().map(|p| p.id()).collect();
+        assert_eq!(ids.contains(&"cast"), cfg!(feature = "cast"));
     }
 }
