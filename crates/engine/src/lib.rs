@@ -2,6 +2,7 @@
 //!
 //! Events go out on an [`events::EventSender`].
 
+pub mod acquire;
 pub mod audio;
 pub mod devices;
 pub mod events;
