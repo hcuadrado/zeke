@@ -2451,6 +2451,11 @@ impl AudioPlayer {
                         reply,
                     } => {
                         let result = (|| -> Result<(), String> {
+                            // Whatever the old backend was: a resume thread
+                            // that lost a race with Stop can leave `paused`
+                            // set with no backend, and a new writer would
+                            // start in its pause loop.
+                            paused.store(false, Ordering::Release);
                             // ── Teardown old backend (GStreamer pipeline only) ──
                             if let Some(old_backend) = backend.take() {
                                 tearing_down.store(true, Ordering::SeqCst);
@@ -2477,10 +2482,9 @@ impl AudioPlayer {
                                         });
                                     }
                                     PlaybackBackend::DirectAlsa { pipeline, .. } => {
-                                        // Unblock writer if paused, then bump generation —
+                                        // The writer is unblocked above; bump generation —
                                         // writer instantly discards stale Data, channel
                                         // drains fast, pipeline can reach Null without blocking.
-                                        paused.store(false, Ordering::Release);
                                         pipeline_epoch.fetch_add(1, Ordering::AcqRel);
                                         track_generation += 1;
                                         writer_gen.store(track_generation, Ordering::Release);
