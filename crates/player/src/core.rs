@@ -1079,12 +1079,21 @@ impl Core {
     /// Issue `loading`'s `Play` again, on the current output, and keep it
     /// as the load in flight. Stamping it with the current output means a
     /// busy answer to this `Play` falls back rather than replaying again.
+    /// On a newer output, the stream is checked against that device first,
+    /// as `play_resolved` does.
     fn replay(&mut self, mut loading: Loading, fx: &mut Vec<Effect>) {
+        let r = loading.resolved.as_ref().expect("PlayStarted follows PlayResolved");
+        if loading.output != self.output_gen
+            && let Some(error) = self.unsupported_by_device(&r.format)
+        {
+            self.stop_at(loading.restored_at, fx);
+            fx.push(Effect::Emit(PlayerEvent::Error { kind: ErrorKind::UnsupportedRate, message: error }));
+            return;
+        }
         self.load += 1;
+        fx.push(Effect::Play { load: self.load, uri: r.uri.clone(), norm_gain: r.norm_gain, start: loading.start_at });
         loading.output = self.output_gen;
         loading.target = self.output_target();
-        let r = loading.resolved.as_ref().expect("PlayStarted follows PlayResolved");
-        fx.push(Effect::Play { load: self.load, uri: r.uri.clone(), norm_gain: r.norm_gain, start: loading.start_at });
         self.loading = Some(loading);
     }
 
@@ -2048,6 +2057,21 @@ mod tests {
         assert_eq!(errors(&fx), [ErrorKind::DeviceBusy]);
         assert!(fell_back(&fx).is_empty());
         assert_eq!(total, 3);
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
+    }
+
+    #[test]
+    fn a_busy_open_after_a_newer_bit_perfect_pick_checks_its_rates() {
+        let mut h = exclusive_harness(Some(DEV));
+        load_to_play(&mut h, &[1, 2]);
+        h.cmd(PlayerCommand::SetOutput { exclusive: true, device: Some("hw:CARD=y,DEV=0".into()), bit_perfect: true });
+        h.send(Input::DeviceRates { output: h.core.output_gen, rates: Some(vec![44100]) });
+        // The track is 48 kHz, which the newer device lacks.
+        let fx = busy(&mut h);
+        assert_eq!(plays(&fx), 0);
+        assert_eq!(errors(&fx), [ErrorKind::UnsupportedRate]);
+        assert!(fell_back(&fx).is_empty());
+        assert!(has(&fx, &Effect::Stop));
         assert_eq!(h.core.state(), PlaybackState::Stopped);
     }
 
