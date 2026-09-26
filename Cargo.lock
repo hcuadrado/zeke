@@ -3481,6 +3481,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "zeke-plugin"
+version = "0.2.0"
+dependencies = [
+ "gtk4",
+ "tokio",
+ "zeke-tidal",
+]
+
+[[package]]
 name = "zeke-tidal"
 version = "0.2.0"
 dependencies = [

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/tidal", "crates/engine", "crates/player", "crates/cli", "app"]
+members = ["crates/tidal", "crates/engine", "crates/player", "crates/cli", "crates/plugins/api", "app"]
 
 [workspace.package]
 version = "0.2.0"
