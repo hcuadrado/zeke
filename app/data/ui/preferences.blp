@@ -16,29 +16,6 @@ template $ZekePreferences: Adw.PreferencesDialog {
     }
 
     Adw.PreferencesGroup {
-      title: "Output";
-      description: "Changes apply from the next track.";
-
-      Adw.SwitchRow exclusive_row {
-        title: "Exclusive mode";
-        subtitle: "Play straight to the ALSA device, resampling once in Zeke. Other apps are silent while Zeke holds the device.";
-      }
-
-      Adw.ComboRow device_row {
-        title: "Device";
-        // The selection as the subtitle, where it has room to be read.
-        use-subtitle: true;
-        sensitive: bind exclusive_row.active;
-      }
-
-      Adw.SwitchRow bit_perfect_row {
-        title: "Bit-perfect";
-        subtitle: "No resampling or conversion. Tracks at a rate the device lacks don’t play.";
-        sensitive: bind exclusive_row.active;
-      }
-    }
-
-    Adw.PreferencesGroup {
       title: "Playback";
 
       Adw.SwitchRow gapless_row {

@@ -53,6 +53,13 @@ pub fn player(kind: ErrorKind, message: &str) -> String {
     }
 }
 
+/// The output device, by its label, was busy when a track opened it, and
+/// the track plays on the system default instead.
+pub fn fell_back(device: Option<&str>) -> String {
+    let device = device.unwrap_or("The audio device");
+    format!("{device} is busy: another app is using it. Zeke switched to System Default.")
+}
+
 /// "96" from the engine's "DAC doesn't support 96kHz — …".
 fn rate_khz(message: &str) -> Option<&str> {
     let at = message.find("kHz")?;
@@ -125,5 +132,14 @@ mod tests {
         assert!(!other.contains("https"));
         assert_eq!(rate_khz("DAC doesn't support 192kHz — x"), Some("192"));
         assert_eq!(rate_khz("no rate"), None);
+    }
+
+    #[test]
+    fn fell_back_message() {
+        assert_eq!(
+            fell_back(Some("USB DAC (DAC, device 0)")),
+            "USB DAC (DAC, device 0) is busy: another app is using it. Zeke switched to System Default."
+        );
+        assert_eq!(fell_back(None), "The audio device is busy: another app is using it. Zeke switched to System Default.");
     }
 }

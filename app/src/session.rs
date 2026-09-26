@@ -121,6 +121,11 @@ pub enum UiEvent {
     /// The saved output device couldn't be used at startup and was
     /// replaced by the system default (already saved).
     OutputReset(String),
+    /// The output device (`None`: exclusive without one) was busy, and the
+    /// track plays on the system default instead.
+    OutputFellBack(Option<String>),
+    /// The output the playing track opened; `None` is the system default.
+    OutputActive(Option<String>),
     /// From MPRIS: bring the window up, quit, set the volume.
     Raise,
     Quit,
@@ -258,19 +263,35 @@ impl Session {
         self.change_settings(move |s| s.max_quality = quality.clone());
     }
 
-    /// `device: None` keeps the saved device (e.g. before the list loaded).
-    /// Normal output saves no device.
-    pub fn set_output(&self, exclusive: bool, device: Option<String>, bit_perfect: bool) {
-        let device = device.or_else(|| self.settings.borrow().output_device.clone());
-        self.send(PlayerCommand::SetOutput { exclusive, device: device.clone(), bit_perfect });
-        self.change_settings(move |s| {
-            s.output_device = device.clone().filter(|_| exclusive);
-            if let Some(device) = &device
-                && exclusive
-            {
-                s.set_bit_perfect_on(device, bit_perfect);
-            }
-        });
+    /// The saved output device; `None` is the system default.
+    pub fn output(&self) -> Option<String> {
+        self.settings.borrow().output_device.clone()
+    }
+
+    /// Play from the next track on `device` (`None`: the system default).
+    pub fn select_output(&self, device: Option<String>) {
+        if self.output() == device {
+            return;
+        }
+        self.send(output_command(&self.settings.borrow(), device.clone()));
+        self.change_settings(move |s| s.output_device = device.clone());
+    }
+
+    /// Save `device`'s bit-perfect flag. On the saved device it applies
+    /// from the next track.
+    pub fn set_device_bit_perfect(&self, device: &str, on: bool) {
+        let id = device.to_string();
+        self.change_settings(move |s| s.set_bit_perfect_on(&id, on));
+        if self.output().as_deref() == Some(device) {
+            self.send(output_command(&self.settings.borrow(), Some(device.to_string())));
+        }
+    }
+
+    /// `device` was busy and the player switched to the system default:
+    /// save that, unless another device was picked since.
+    pub fn output_fell_back(&self, device: &str) {
+        let device = device.to_string();
+        self.change_settings(move |s| clear_output_if(s, &device));
     }
 
     pub fn set_gapless(&self, on: bool) {
@@ -336,7 +357,7 @@ fn startup_output(
     }
 }
 
-/// ALSA playback devices for the preferences, with stable ids
+/// ALSA playback devices for the output picker, with stable ids
 /// (`hw:CARD=<id>,DEV=<n>`). Blocks for up to ~2 s: run it off the main thread.
 pub fn list_devices() -> Result<Vec<AudioDevice>, String> {
     let mut out: Vec<AudioDevice> = Vec::new();
@@ -647,8 +668,14 @@ async fn hub(
             Update::Player(PlayerEvent::PrefetchFailed { item, error }) => {
                 log::warn!("[app] could not resolve next track {}: {error}", item.track_id);
             }
-            Update::Player(ev @ (PlayerEvent::OutputFellBack { .. } | PlayerEvent::OutputActive { .. })) => {
-                log::info!("[app] {ev:?}");
+            Update::Player(PlayerEvent::OutputFellBack { device }) => {
+                log::warn!("[app] {} is busy; playing on System Default", device.as_deref().unwrap_or("the device"));
+                let _ = ui.send(UiEvent::OutputFellBack(device)).await;
+            }
+            Update::Player(PlayerEvent::OutputActive { exclusive, device }) => {
+                let device = device.filter(|_| exclusive);
+                log::info!("[app] output: {}", device.as_deref().unwrap_or("System Default"));
+                let _ = ui.send(UiEvent::OutputActive(device)).await;
             }
             Update::Engine(EngineEvent::SignalPathChanged(p)) => {
                 let _ = ui.send(UiEvent::SignalPath(p)).await;
