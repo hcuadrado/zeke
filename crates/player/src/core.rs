@@ -36,6 +36,8 @@ pub struct Config {
     /// rate the device takes, and gapless only follows a track of the same
     /// format.
     pub bit_perfect: bool,
+    /// Exclusive ALSA output, as last set with `SetOutput`.
+    pub exclusive: bool,
 }
 
 impl Default for Config {
@@ -46,6 +48,7 @@ impl Default for Config {
             prefetch_window: 30.0,
             max_quality: "HI_RES_LOSSLESS".into(),
             bit_perfect: false,
+            exclusive: false,
         }
     }
 }
@@ -304,6 +307,16 @@ pub enum PlayerEvent {
     Skipped { item: QueueItem, error: String },
     /// Playback stopped. `message` is for the log.
     Error { kind: ErrorKind, message: String },
+    /// The exclusive `device` (`None`: the engine's default) was busy when
+    /// a track opened it, so output went back to the system default and the
+    /// track is played again there. The saved output is the caller's to
+    /// change.
+    OutputFellBack { device: Option<String> },
+    /// The output the playing track opened, sent when a track starts on an
+    /// output other than the last one reported. A gapless switch opens
+    /// nothing, so a next track prerolled before a `SetOutput` still plays
+    /// on the old output; the track after it starts on the new one.
+    OutputActive { exclusive: bool, device: Option<String> },
 }
 
 #[derive(Debug, Clone)]
@@ -339,6 +352,10 @@ struct Loading {
     /// This load resumes a restored entry saved at this position: if it
     /// fails or is cancelled, the entry goes back to `Restored` there.
     restored_at: Option<f64>,
+    /// `output_gen` when its `Play` was issued.
+    output: u64,
+    /// The output that `Play` opens: (exclusive, device).
+    target: (bool, Option<String>),
 }
 
 pub struct Core {
@@ -371,6 +388,10 @@ pub struct Core {
     /// The output changed while a track played: the next track starts a new
     /// pipeline (so it gets the new output) instead of a gapless switch.
     output_changed: bool,
+    /// The exclusive device, as last set with `SetOutput`.
+    device: Option<String>,
+    /// The output last reported with `OutputActive`.
+    active: Option<(bool, Option<String>)>,
     /// `Queue::revision` last published as `QueueChanged`.
     published_queue: Option<u64>,
 }
@@ -396,6 +417,8 @@ impl Core {
             device_rates: None,
             output_gen: 0,
             output_changed: false,
+            device: None,
+            active: None,
             published_queue: None,
         }
     }
@@ -583,8 +606,14 @@ impl Core {
                 self.clear_prefetch("quality changed", fx);
                 self.maybe_prefetch(fx);
             }
+            // In bit-perfect mode the runner probes the device's rates here,
+            // before the card is reserved, so the probe can find it busy
+            // while PipeWire has it open. The early rate check is skipped
+            // then; the engine still refuses an unsupported rate at open.
             PlayerCommand::SetOutput { exclusive, device, bit_perfect } => {
                 self.config.bit_perfect = exclusive && bit_perfect;
+                self.config.exclusive = exclusive;
+                self.device = device.clone();
                 self.device_rates = None;
                 self.output_gen += 1;
                 // The engine drops a prerolled next track on any mode or
@@ -724,7 +753,15 @@ impl Core {
         self.load += 1;
         // Whatever was armed belongs to the track being replaced.
         self.clear_prefetch("a new track is loading", fx);
-        self.loading = Some(Loading { item: item.clone(), via, resolved: None, start_at: None, restored_at: None });
+        self.loading = Some(Loading {
+            item: item.clone(),
+            via,
+            resolved: None,
+            start_at: None,
+            restored_at: None,
+            output: self.output_gen,
+            target: self.output_target(),
+        });
         self.set_state(PlaybackState::Loading, fx);
         fx.push(Effect::Resolve {
             load: self.load,
@@ -919,7 +956,11 @@ impl Core {
                 }
                 let start = self.loading.as_ref().and_then(|l| l.start_at);
                 fx.push(Effect::Play { load, uri: r.uri.clone(), norm_gain: r.norm_gain, start });
-                self.loading.as_mut().expect("checked above").resolved = Some(r);
+                let target = self.output_target();
+                let loading = self.loading.as_mut().expect("checked above");
+                loading.resolved = Some(r);
+                loading.output = self.output_gen;
+                loading.target = target;
             }
             Err(e) => {
                 let loading = self.loading.take().expect("checked above");
@@ -977,6 +1018,11 @@ impl Core {
                     peak_amplitude: r.peak_amplitude,
                 });
                 self.set_state(PlaybackState::Playing, fx);
+                if self.active.as_ref() != Some(&loading.target) {
+                    let (exclusive, device) = loading.target.clone();
+                    self.active = Some(loading.target);
+                    fx.push(Effect::Emit(PlayerEvent::OutputActive { exclusive, device }));
+                }
                 let (index, len) = self.queue.position();
                 fx.push(Effect::Emit(PlayerEvent::TrackStarted {
                     item: loading.item,
@@ -993,10 +1039,51 @@ impl Core {
                 self.maybe_prefetch(fx);
             }
             Err(e) => {
+                let kind = ErrorKind::of_engine("", &e);
+                // An exclusive open that found the device busy.
+                if kind == ErrorKind::DeviceBusy && loading.target.0 {
+                    if loading.output == self.output_gen {
+                        self.fall_back(loading, fx);
+                    } else {
+                        // The output changed since this Play was issued: try
+                        // the newer one.
+                        self.replay(loading, fx);
+                    }
+                    return;
+                }
                 self.stop_at(loading.restored_at, fx);
-                fx.push(Effect::Emit(PlayerEvent::Error { kind: ErrorKind::of_engine("", &e), message: e }));
+                fx.push(Effect::Emit(PlayerEvent::Error { kind, message: e }));
             }
         }
+    }
+
+    /// The output a `Play` issued now opens.
+    fn output_target(&self) -> (bool, Option<String>) {
+        (self.config.exclusive, self.device.clone())
+    }
+
+    /// Switch to the system default and play `loading` again there.
+    fn fall_back(&mut self, loading: Loading, fx: &mut Vec<Effect>) {
+        self.config.exclusive = false;
+        self.config.bit_perfect = false;
+        self.device_rates = None;
+        self.output_gen += 1;
+        let device = self.device.take();
+        fx.push(Effect::ConfigureOutput { output: self.output_gen, exclusive: false, device: None, bit_perfect: false });
+        self.replay(loading, fx);
+        fx.push(Effect::Emit(PlayerEvent::OutputFellBack { device }));
+    }
+
+    /// Issue `loading`'s `Play` again, on the current output, and keep it
+    /// as the load in flight. Stamping it with the current output means a
+    /// busy answer to this `Play` falls back rather than replaying again.
+    fn replay(&mut self, mut loading: Loading, fx: &mut Vec<Effect>) {
+        self.load += 1;
+        loading.output = self.output_gen;
+        loading.target = self.output_target();
+        let r = loading.resolved.as_ref().expect("PlayStarted follows PlayResolved");
+        fx.push(Effect::Play { load: self.load, uri: r.uri.clone(), norm_gain: r.norm_gain, start: loading.start_at });
+        self.loading = Some(loading);
     }
 
     /// The engine is already playing the armed track; catch the queue up
@@ -1821,6 +1908,214 @@ mod tests {
         assert_eq!(h.core.device_rates, None);
         h.send(Input::DeviceRates { output: h.core.output_gen, rates: Some(vec![]) });
         assert_eq!(h.core.device_rates, None, "an empty probe is unknown");
+    }
+
+    const DEV: &str = "hw:CARD=x,DEV=0";
+
+    /// An exclusive harness on `device`.
+    fn exclusive_harness(device: Option<&str>) -> Harness {
+        let mut h = Harness::new();
+        h.cmd(PlayerCommand::SetOutput { exclusive: true, device: device.map(Into::into), bit_perfect: false });
+        h
+    }
+
+    /// Load `tracks` and resolve the first; the `Play` is then in flight.
+    fn load_to_play(h: &mut Harness, tracks: &[u64]) {
+        h.cmd(PlayerCommand::Load { tracks: QueueTrack::from_ids(tracks), start: Some(0), album_mode: false, shuffle: false, repeat: RepeatMode::Off });
+        let fx = h.send(Input::PlayResolved { load: h.core.load, result: Ok(resolved("1", 200.0)) });
+        assert_eq!(plays(&fx), 1);
+    }
+
+    fn busy(h: &mut Harness) -> Vec<Effect> {
+        h.send(Input::PlayStarted { load: h.core.load, result: Err("device_busy".into()) })
+    }
+
+    fn plays(fx: &[Effect]) -> usize {
+        fx.iter().filter(|e| matches!(e, Effect::Play { .. })).count()
+    }
+
+    fn errors(fx: &[Effect]) -> Vec<ErrorKind> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Emit(PlayerEvent::Error { kind, .. }) => Some(*kind),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn fell_back(fx: &[Effect]) -> Vec<Option<String>> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Emit(PlayerEvent::OutputFellBack { device }) => Some(device.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn active(fx: &[Effect]) -> Vec<(bool, Option<String>)> {
+        fx.iter()
+            .filter_map(|e| match e {
+                Effect::Emit(PlayerEvent::OutputActive { exclusive, device }) => Some((*exclusive, device.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_busy_exclusive_open_falls_back_to_system_default() {
+        let mut h = exclusive_harness(Some(DEV));
+        let old = h.core.output_gen;
+        load_to_play(&mut h, &[1, 2]);
+        let fx = busy(&mut h);
+        let configure = fx
+            .iter()
+            .position(|e| *e == Effect::ConfigureOutput { output: old + 1, exclusive: false, device: None, bit_perfect: false })
+            .expect("switches to the system default");
+        let play = fx
+            .iter()
+            .position(|e| matches!(e, Effect::Play { uri, start: None, .. } if uri == "uri:1"))
+            .expect("plays the same track again");
+        assert!(configure < play, "configured before the replay");
+        assert_eq!(plays(&fx), 1);
+        assert_eq!(fell_back(&fx), [Some(DEV.to_string())]);
+        assert!(errors(&fx).is_empty());
+        assert_eq!(h.core.output_gen, old + 1);
+        assert!(!h.core.config.exclusive && h.core.device.is_none());
+        // The busy device's rates, arriving late, are not taken.
+        h.send(Input::DeviceRates { output: old, rates: Some(vec![48000]) });
+        assert_eq!(h.core.device_rates, None);
+        assert!(h.core.loading.as_ref().unwrap().resolved.is_some());
+        assert_eq!(h.core.state(), PlaybackState::Loading);
+
+        let fx = h.send(Input::PlayStarted { load: h.core.load, result: Ok(()) });
+        assert_eq!(h.core.state(), PlaybackState::Playing);
+        assert_eq!(started(&fx), Some((1, Transition::Start)));
+    }
+
+    #[test]
+    fn a_busy_open_after_a_newer_pick_does_not_fall_back() {
+        let mut h = exclusive_harness(Some(DEV));
+        load_to_play(&mut h, &[1, 2]);
+        // Picked while the first Play was in flight.
+        h.cmd(PlayerCommand::SetOutput { exclusive: true, device: Some("hw:CARD=y,DEV=0".into()), bit_perfect: false });
+        let output = h.core.output_gen;
+        let fx = busy(&mut h);
+        assert_eq!(plays(&fx), 1, "plays again on the newer pick");
+        assert!(!fx.iter().any(|e| matches!(e, Effect::ConfigureOutput { .. })));
+        assert!(fell_back(&fx).is_empty() && errors(&fx).is_empty());
+        assert_eq!(h.core.output_gen, output);
+        assert!(h.core.loading.as_ref().unwrap().resolved.is_some());
+
+        let fx = h.send(Input::PlayStarted { load: h.core.load, result: Ok(()) });
+        assert_eq!(h.core.state(), PlaybackState::Playing);
+        assert_eq!(active(&fx), [(true, Some("hw:CARD=y,DEV=0".to_string()))]);
+    }
+
+    #[test]
+    fn a_busy_newer_pick_that_is_also_busy_falls_back_once() {
+        let mut h = exclusive_harness(Some(DEV));
+        load_to_play(&mut h, &[1, 2]);
+        h.cmd(PlayerCommand::SetOutput { exclusive: true, device: Some("hw:CARD=y,DEV=0".into()), bit_perfect: false });
+        let mut total = 1;
+        let fx = busy(&mut h);
+        total += plays(&fx);
+        assert!(fell_back(&fx).is_empty());
+        let fx = busy(&mut h);
+        total += plays(&fx);
+        assert_eq!(fell_back(&fx), [Some("hw:CARD=y,DEV=0".to_string())]);
+        // Even the system default is busy: that is an error, not another try.
+        let fx = busy(&mut h);
+        total += plays(&fx);
+        assert_eq!(errors(&fx), [ErrorKind::DeviceBusy]);
+        assert!(fell_back(&fx).is_empty());
+        assert_eq!(total, 3);
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
+    }
+
+    #[test]
+    fn exclusive_without_a_device_falls_back_with_none() {
+        let mut h = exclusive_harness(None);
+        load_to_play(&mut h, &[1]);
+        let fx = busy(&mut h);
+        assert_eq!(fell_back(&fx), [None]);
+        assert_eq!(plays(&fx), 1);
+        assert!(errors(&fx).is_empty());
+    }
+
+    #[test]
+    fn a_busy_open_resuming_a_restored_track_keeps_its_position() {
+        let mut h = exclusive_harness(Some(DEV));
+        h.cmd(PlayerCommand::Restore(Box::new(saved_queue(42_000))));
+        h.cmd(PlayerCommand::TogglePause);
+        h.send(Input::PlayResolved { load: h.core.load, result: Ok(resolved("2", 200.0)) });
+        let fx = busy(&mut h);
+        assert!(fx.iter().any(|e| matches!(e, Effect::Play { start: Some(s), .. } if (*s - 42.0).abs() < 1e-9)));
+        assert_eq!(fell_back(&fx), [Some(DEV.to_string())]);
+        let loading = h.core.loading.as_ref().unwrap();
+        assert!(loading.resolved.is_some());
+        assert_eq!(loading.restored_at, Some(42.0));
+        assert_eq!(h.core.persisted().unwrap().position_ms, 42_000);
+
+        h.send(Input::PlayStarted { load: h.core.load, result: Ok(()) });
+        assert_eq!(h.core.state(), PlaybackState::Playing);
+        assert_eq!(h.core.position, 42.0);
+    }
+
+    #[test]
+    fn a_busy_open_on_system_default_is_an_error() {
+        let mut h = Harness::new();
+        load_to_play(&mut h, &[1, 2]);
+        let fx = busy(&mut h);
+        assert_eq!(errors(&fx), [ErrorKind::DeviceBusy]);
+        assert_eq!(plays(&fx), 0);
+        assert!(fell_back(&fx).is_empty());
+        assert!(!fx.iter().any(|e| matches!(e, Effect::ConfigureOutput { .. })));
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
+    }
+
+    #[test]
+    fn output_active_changes_only_when_the_next_track_starts() {
+        let mut h = Harness::new();
+        let fx = h.load(&[1, 2, 3, 4], RepeatMode::Off, false);
+        assert_eq!(active(&fx), [(false, None)]);
+        // Another track on the same output reports nothing.
+        let fx = h.cmd(PlayerCommand::Next);
+        assert!(active(&h.finish_load(&fx, 200.0)).is_empty());
+        // A pick applies from the next track.
+        let fx = h.cmd(PlayerCommand::SetOutput { exclusive: true, device: Some(DEV.into()), bit_perfect: false });
+        assert!(active(&fx).is_empty());
+        let fx = h.send(Input::TrackFinished);
+        assert!(active(&fx).is_empty());
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(active(&fx), [(true, Some(DEV.to_string()))]);
+        // A gapless switch opens nothing.
+        let (pf, next) = resolve_next(&h.send(Input::Tick { position: 185.0, track: h.core.track_seq() })).unwrap();
+        h.send(Input::NextResolved { prefetch: pf, result: Ok(resolved("4", 200.0)) });
+        let fx = h.send(Input::TrackAdvanced { track_id: next.track_id, qid: next.qid, replay_gain: -7.5, peak_amplitude: 0.9 });
+        assert_eq!(started(&fx), Some((4, Transition::Gapless)));
+        assert!(active(&fx).is_empty());
+    }
+
+    #[test]
+    fn a_fallback_reports_system_default_as_active() {
+        let mut h = exclusive_harness(Some(DEV));
+        load_to_play(&mut h, &[1]);
+        let fx = busy(&mut h);
+        assert!(active(&fx).is_empty(), "nothing played on the device");
+        let fx = h.send(Input::PlayStarted { load: h.core.load, result: Ok(()) });
+        assert_eq!(active(&fx), [(false, None)]);
+    }
+
+    #[test]
+    fn a_device_disconnected_error_stops_the_engine() {
+        let mut h = exclusive_harness(Some(DEV));
+        h.load(&[1, 2], RepeatMode::Off, false);
+        assert_eq!(h.core.state(), PlaybackState::Playing);
+        let fx = h.send(Input::AudioError { kind: "device_disconnected".into(), message: None });
+        assert!(has(&fx, &Effect::Stop));
+        assert_eq!(errors(&fx), [ErrorKind::Device]);
+        assert!(fell_back(&fx).is_empty());
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
     }
 
     #[test]

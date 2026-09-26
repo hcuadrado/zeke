@@ -698,6 +698,18 @@ async fn play_queue(state: Arc<AppState>, mut q: QueueOptions, opts: PlayOptions
                         log::error!("[player] stopped on error ({kind:?}): {message}");
                         break Err(message);
                     }
+                    PlayerEvent::OutputFellBack { device } => log::warn!(
+                        "[player] {} is busy: playing on the system default",
+                        device.as_deref().unwrap_or("the default exclusive device")
+                    ),
+                    PlayerEvent::OutputActive { exclusive, device } => log::info!(
+                        "[player] output: {}",
+                        match (exclusive, device.as_deref()) {
+                            (false, _) => "system default".to_string(),
+                            (true, Some(d)) => format!("{d} (exclusive)"),
+                            (true, None) => "default device (exclusive)".to_string(),
+                        }
+                    ),
                 },
                 Ok(Update::Engine(EngineEvent::SignalPathChanged(p))) => {
                     let line = signal_path_line(&p);

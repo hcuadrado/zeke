@@ -610,6 +610,9 @@ async fn hub(
             Update::Player(PlayerEvent::PrefetchFailed { item, error }) => {
                 log::warn!("[app] could not resolve next track {}: {error}", item.track_id);
             }
+            Update::Player(ev @ (PlayerEvent::OutputFellBack { .. } | PlayerEvent::OutputActive { .. })) => {
+                log::info!("[app] {ev:?}");
+            }
             Update::Engine(EngineEvent::SignalPathChanged(p)) => {
                 let _ = ui.send(UiEvent::SignalPath(p)).await;
             }
