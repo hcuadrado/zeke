@@ -37,6 +37,8 @@ impl ZekeWindow {
                 window.load_outputs();
             }
         ));
+        // Plugins' sections go under the local outputs.
+        self.imp().output_box.append(self.plugins().output_sections());
         self.refresh_outputs();
     }
 

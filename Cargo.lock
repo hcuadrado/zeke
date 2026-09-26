@@ -3432,6 +3432,7 @@ dependencies = [
  "webkit6",
  "zeke-engine",
  "zeke-player",
+ "zeke-plugin",
  "zeke-tidal",
 ]
 

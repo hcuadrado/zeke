@@ -45,6 +45,7 @@ impl ZekeWindow {
             let Some(window) = window.upgrade() else { return };
             if let Ok(Some(tokens)) = &result {
                 window.imp().account.set(tokens.user_id);
+                window.plugins().signed_in(tokens.user_id);
             }
             if let Err(e) = result
                 && window.report("restore the TIDAL session", &e).is_none()
@@ -167,6 +168,7 @@ impl ZekeWindow {
                             log::info!("[app] another account signed in; clearing the queue");
                             window.clear_queue();
                         }
+                        window.plugins().signed_in(tokens.user_id);
                         imp.pkce.take();
                         imp.login_entry.set_text("");
                         window.show_main();
@@ -208,6 +210,7 @@ impl ZekeWindow {
     pub fn logout(&self) {
         self.clear_queue();
         self.imp().account.set(None);
+        self.plugins().signed_out();
         self.imp().sheet.set_open(false);
         let state = Arc::clone(&self.session().state);
         let window = self.downgrade();

@@ -117,11 +117,14 @@ mod imp {
         #[template_child]
         pub output_list: TemplateChild<gtk::ListBox>,
         #[template_child]
+        pub output_box: TemplateChild<gtk::Box>,
+        #[template_child]
         pub bar_heart: TemplateChild<gtk::Button>,
         #[template_child]
         pub sheet_heart: TemplateChild<gtk::Button>,
 
         pub session: OnceCell<Rc<Session>>,
+        pub plugins: OnceCell<Rc<crate::plugins::Host>>,
         /// Kept between "Open TIDAL Login" and the pasted redirect.
         pub pkce: RefCell<Option<PkceAuthParams>>,
         pub queue: OnceCell<gio::ListStore>,
@@ -200,11 +203,17 @@ glib::wrapper! {
 
 #[gtk::template_callbacks]
 impl ZekeWindow {
-    pub fn new(app: &adw::Application, session: Rc<Session>, events: async_channel::Receiver<UiEvent>) -> Self {
+    pub fn new(
+        app: &adw::Application,
+        session: Rc<Session>,
+        plugins: Rc<crate::plugins::Host>,
+        events: async_channel::Receiver<UiEvent>,
+    ) -> Self {
         let window: Self = glib::Object::builder().property("application", app).build();
         let logged_in = session.settings().auth_tokens.is_some();
         window.imp().covers.set(crate::covers::Covers::new(Arc::clone(&session.state))).expect("set once");
         window.imp().session.set(session).expect("set once");
+        window.imp().plugins.set(plugins).expect("set once");
         window.setup_actions();
         window.setup_playback_keys();
         window.setup_player_view();
@@ -222,6 +231,10 @@ impl ZekeWindow {
 
     pub fn session(&self) -> &Rc<Session> {
         self.imp().session.get().expect("set in new()")
+    }
+
+    pub fn plugins(&self) -> &Rc<crate::plugins::Host> {
+        self.imp().plugins.get().expect("set in new()")
     }
 
     pub fn covers(&self) -> &crate::covers::Covers {
