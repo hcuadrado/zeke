@@ -6,6 +6,7 @@ use serde::Serialize;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
+use crate::acquire::{reuse_lease, Hold, Lease, DEVICE_BUSY};
 use crate::events::{EngineEvent, EventSender};
 
 /// Read the real GStreamer registry.
@@ -395,9 +396,64 @@ enum WriterCommand {
     Shutdown,
 }
 
+/// The ALSA writer, as the audio thread keeps it across PlayUrl calls
+/// (track changes keep the DAC open), with what it probed and the card's
+/// reservation.
+#[derive(Default)]
+struct WriterSlot {
+    tx: Option<crossbeam_channel::Sender<WriterCommand>>,
+    thread: Option<JoinHandle<()>>,
+    fmt: Option<PcmFormat>,
+    supported_fmts: Option<Vec<&'static str>>,
+    supported_rates: Option<Vec<u32>>,
+    device: Option<String>,
+    /// The mode the live writer was spawned in. `bit_perfect` is baked into
+    /// the writer thread at spawn (it drives reopen format negotiation), so a
+    /// same-device exclusive↔bit-perfect toggle must force a respawn rather
+    /// than reuse a stale-mode writer.
+    bit_perfect: Option<bool>,
+    lease: Option<Lease>,
+}
+
+impl WriterSlot {
+    fn alive(&self) -> bool {
+        self.thread.as_ref().is_some_and(|h| !h.is_finished())
+    }
+
+    /// Ask the writer to stop, without waiting for it.
+    fn request_shutdown(&mut self) {
+        if let Some(tx) = self.tx.take() {
+            // Blocking, not a timeout: the writer may be draining the DAC
+            // after a gapless boundary with a full channel, and a lost
+            // Shutdown kept the device open until every sender was dropped.
+            // A dead writer makes this return at once.
+            let _ = tx.send(WriterCommand::Shutdown);
+        }
+    }
+
+    /// Stop the writer, wait for it to close the device, then release the
+    /// card to its previous owner.
+    fn shutdown(&mut self) {
+        self.request_shutdown();
+        if let Some(h) = self.thread.take() {
+            h.join().ok();
+        }
+        self.lease = None;
+    }
+}
+
+impl Drop for WriterSlot {
+    /// The card is released only once the writer has closed the device. The
+    /// audio thread's command loop never ends, so this only runs while a
+    /// panic unwinds it.
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Active playback backend — determines command dispatch.
-/// The ALSA writer sender + thread handle live as separate state variables
-/// so they persist across PlayUrl calls (track changes keep DAC open).
+/// The ALSA writer lives in a [`WriterSlot`] so it persists across PlayUrl
+/// calls.
 enum PlaybackBackend {
     /// Normal: full GStreamer pipeline with autoaudiosink.
     /// `concat` sits at the head (per-branch `queue` → concat → chain → sink)
@@ -1131,15 +1187,69 @@ fn pick_capsfilter_format(source: &str, dac_supported: &[String]) -> String {
 /// Open `device` without blocking, probe its rates and close it again.
 #[cfg(target_os = "linux")]
 fn probe_device_rates(device: &str) -> Result<Vec<u32>, String> {
-    let pcm = alsa::PCM::new(device, alsa::Direction::Playback, true).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("busy") || msg.contains("EBUSY") {
-            "device_busy".to_string()
-        } else {
-            format!("Failed to open ALSA device: {e}")
-        }
-    })?;
+    let pcm = alsa::PCM::new(device, alsa::Direction::Playback, true).map_err(open_error)?;
     Ok(probe_supported_rates(&pcm))
+}
+
+/// Open `device` for playback in blocking mode, failing at once with
+/// [`DEVICE_BUSY`] when another client holds it.
+///
+/// A blocking open doesn't wait for a busy `hw` PCM: alsa-lib opens the
+/// device node with `O_NONBLOCK` and clears the flag only once the open
+/// succeeded (seen with alsa-lib 1.2.16), which is `snd_pcm_nonblock(h, 0)`
+/// after a non-blocking open. The `alsa` crate has no call for that switch,
+/// so this relies on alsa-lib doing it; every playback open goes through
+/// here.
+#[cfg(target_os = "linux")]
+fn open_pcm(device: &str) -> Result<alsa::PCM, String> {
+    alsa::PCM::new(device, alsa::Direction::Playback, false).map_err(open_error)
+}
+
+/// An ALSA open error as the engine reports it: [`DEVICE_BUSY`] when
+/// another client holds the device.
+#[cfg(target_os = "linux")]
+fn open_error(e: alsa::Error) -> String {
+    let msg = e.to_string();
+    if msg.contains("busy") || msg.contains("EBUSY") {
+        DEVICE_BUSY.to_string()
+    } else {
+        format!("Failed to open ALSA device: {e}")
+    }
+}
+
+/// Zeke: whether `device` can be opened now, for the startup check. Opens it
+/// without blocking and closes it again; takes no reservation. Fails with
+/// `device_busy` when another client holds it.
+pub fn probe_device(device: &str) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    return probe_device_rates(device).map(drop);
+    #[cfg(not(target_os = "linux"))]
+    return Err(format!("{device}: exclusive output requires Linux"));
+}
+
+/// Zeke: take `device`'s card from its ReserveDevice1 owner (PipeWire) and
+/// open it for exclusive playback. `held` is the card's name when Zeke
+/// already owns it.
+///
+/// Runs on the audio thread, so Stop, Pause and every other command queue
+/// behind it. It normally takes milliseconds, but each bus call can block up
+/// to 2 s when the bus or the card's owner hangs. A takeover is up to six
+/// calls (asking for the name, reading the owner's name for the log, and
+/// two rounds of release and replace), about 12 s, and the previous owner
+/// then gets up to 1 s to close the PCM. Giving the name back after a
+/// failure adds up to two more calls.
+#[cfg(target_os = "linux")]
+fn acquire_device(device: &str, held: Option<Hold>) -> Result<(alsa::PCM, Lease), String> {
+    let card = crate::devices::card_index(device);
+    let (pcm, hold) = crate::acquire::acquire(
+        card,
+        &crate::reserve::RESERVER,
+        held,
+        || open_pcm(device),
+        std::time::Instant::now,
+        std::thread::sleep,
+    )?;
+    Ok((pcm, Lease::new(card, hold)))
 }
 
 /// Probe which standard sample rates an ALSA device supports.
@@ -1371,7 +1481,9 @@ fn spawn_alsa_writer(
     signal_path: Arc<SignalPathTracker>,
     decoded_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
     output_cell: Arc<Mutex<Option<crate::pipeline_probe::PadCaps>>>,
-) -> Result<(crossbeam_channel::Sender<WriterCommand>, JoinHandle<()>, PcmFormat, Vec<&'static str>, Vec<u32>), String> {
+    // Zeke: the card's reservation, when Zeke already holds it.
+    held: Option<Hold>,
+) -> Result<(crossbeam_channel::Sender<WriterCommand>, JoinHandle<()>, PcmFormat, Vec<&'static str>, Vec<u32>, Lease), String> {
     let device = device.to_string();
     let initial_format = initial_format.clone();
     // 64, not more. With `sync=false` the pipeline keeps this full,
@@ -1382,15 +1494,10 @@ fn spawn_alsa_writer(
     // decoded branch queue upstream of concat is the real reserve.
     let (tx, rx) = crossbeam_channel::bounded::<WriterCommand>(64);
 
-    // Open device eagerly to detect EBUSY immediately
-    let pcm = alsa::PCM::new(&device, alsa::Direction::Playback, false).map_err(|e| {
-        let msg = e.to_string();
-        if msg.contains("busy") || msg.contains("EBUSY") {
-            "device_busy".to_string()
-        } else {
-            format!("Failed to open ALSA device: {e}")
-        }
-    })?;
+    // Open device eagerly to detect EBUSY immediately. `pcm` is bound after
+    // `lease` so an error below closes the device before the card is
+    // released.
+    let (lease, pcm) = acquire_device(&device, held).map(|(pcm, lease)| (lease, pcm))?;
 
     let supported_gst_formats = probe_supported_gst_formats(&pcm);
     log::debug!("[alsa-writer] DAC supported GStreamer formats: {:?}", supported_gst_formats);
@@ -1622,8 +1729,8 @@ fn spawn_alsa_writer(
                 sbuf: &mut Vec<u8>,
                 bit_perfect: bool,
             ) -> Result<(alsa::PCM, PcmFormat), String> {
-                let pcm = alsa::PCM::new(device, alsa::Direction::Playback, false)
-                    .map_err(|e| format!("Failed to reopen ALSA device: {e}"))?;
+                // Never waits for the device: the card is held meanwhile.
+                let pcm = open_pcm(device)?;
                 let negotiated = configure_alsa_hwparams(&pcm, fmt, bit_perfect)?;
                 pcm.prepare().map_err(|e| format!("pcm.prepare: {e}"))?;
                 sr.store(negotiated.sample_rate, Ordering::Relaxed);
@@ -2064,7 +2171,7 @@ fn spawn_alsa_writer(
         })
         .map_err(|e| format!("Failed to spawn ALSA writer thread: {e}"))?;
 
-    Ok((tx, handle, negotiated_fmt, supported_gst_formats, supported_rates))
+    Ok((tx, handle, negotiated_fmt, supported_gst_formats, supported_rates, lease))
 }
 
 // ── Audio command protocol ─────────────────────────────────────────────
@@ -2222,17 +2329,7 @@ impl AudioPlayer {
 
             let mut backend: Option<PlaybackBackend> = None;
             // ALSA writer state — lives outside PlaybackBackend so it persists across track changes
-            let mut writer_tx: Option<crossbeam_channel::Sender<WriterCommand>> = None;
-            let mut writer_thread: Option<JoinHandle<()>> = None;
-            let mut writer_fmt: Option<PcmFormat> = None;
-            let mut writer_supported_fmts: Option<Vec<&'static str>> = None;
-            let mut writer_supported_rates: Option<Vec<u32>> = None;
-            let mut writer_device: Option<String> = None;
-            // Track the mode the live writer was spawned in. `bit_perfect` is
-            // baked into the writer thread at spawn (it drives reopen format
-            // negotiation), so a same-device exclusive↔bit-perfect toggle must
-            // force a respawn rather than reuse a stale-mode writer.
-            let mut writer_bit_perfect: Option<bool> = None;
+            let mut writer = WriterSlot::default();
             let frames_written = Arc::new(AtomicU64::new(0));
             let current_sample_rate = Arc::new(AtomicU32::new(48000));
             let writer_gen = Arc::new(AtomicU64::new(0));
@@ -2373,7 +2470,7 @@ impl AudioPlayer {
                                         pipeline_epoch.fetch_add(1, Ordering::AcqRel);
                                         track_generation += 1;
                                         writer_gen.store(track_generation, Ordering::Release);
-                                        if let Some(ref tx) = writer_tx {
+                                        if let Some(ref tx) = writer.tx {
                                             let _ = tx.send_timeout(
                                                 WriterCommand::Flush,
                                                 std::time::Duration::from_millis(200),
@@ -2490,23 +2587,21 @@ impl AudioPlayer {
                                     );
 
                                     // Reuse writer if alive, otherwise spawn new one
-                                    let writer_alive = writer_thread
-                                        .as_ref()
-                                        .map(|h| !h.is_finished())
-                                        .unwrap_or(false);
+                                    let device_changed = writer.device.as_deref() != Some(dev);
+                                    let mode_changed = writer.bit_perfect != Some(bit_perfect);
 
-                                    let device_changed = writer_device.as_deref() != Some(dev);
-                                    let mode_changed = writer_bit_perfect != Some(bit_perfect);
-
-                                    if !writer_alive || writer_tx.is_none() || device_changed || mode_changed {
-                                        // Shut down old writer cleanly
-                                        if let Some(tx) = writer_tx.take() {
-                                            tx.try_send(WriterCommand::Shutdown).ok();
-                                        }
-                                        if let Some(h) = writer_thread.take() {
-                                            h.join().ok();
-                                        }
-                                        let (tx, handle, negotiated_fmt, supported_gst_fmts, supported_rates) = spawn_alsa_writer(
+                                    if !writer.alive() || writer.tx.is_none() || device_changed || mode_changed {
+                                        // Keep the card's reservation for a device on
+                                        // the same card, so PipeWire doesn't get the card
+                                        // back in between; a lease on another card is
+                                        // released once the old writer has closed it.
+                                        let (held, stale) = reuse_lease(
+                                            writer.lease.take(),
+                                            crate::devices::card_index(dev),
+                                        );
+                                        writer.shutdown();
+                                        drop(stale);
+                                        let (tx, handle, negotiated_fmt, supported_gst_fmts, supported_rates, lease) = spawn_alsa_writer(
                                             dev,
                                             &default_fmt,
                                             events.clone(),
@@ -2523,22 +2618,26 @@ impl AudioPlayer {
                                             Arc::clone(&signal_path),
                                             Arc::clone(&decoded_cell_thread),
                                             Arc::clone(&output_cell_thread),
+                                            held,
                                         )?;
-                                        writer_tx = Some(tx);
-                                        writer_thread = Some(handle);
-                                        writer_fmt = Some(negotiated_fmt);
-                                        writer_supported_fmts = Some(supported_gst_fmts);
-                                        writer_supported_rates = Some(supported_rates);
-                                        writer_device = Some(dev.to_string());
-                                        writer_bit_perfect = Some(bit_perfect);
+                                        writer = WriterSlot {
+                                            tx: Some(tx),
+                                            thread: Some(handle),
+                                            fmt: Some(negotiated_fmt),
+                                            supported_fmts: Some(supported_gst_fmts),
+                                            supported_rates: Some(supported_rates),
+                                            device: Some(dev.to_string()),
+                                            bit_perfect: Some(bit_perfect),
+                                            lease: Some(lease),
+                                        };
                                     }
 
-                                    let wtx = writer_tx.as_ref().unwrap().clone();
+                                    let wtx = writer.tx.as_ref().unwrap().clone();
 
                                     // Build appsink pipeline
-                                    let fmt_for_pipeline = writer_fmt.as_ref().unwrap_or(&default_fmt);
-                                    let supported_fmts_for_pipeline = writer_supported_fmts.as_deref().unwrap_or(&["S32LE"]);
-                                    let supported_rates_for_pipeline = writer_supported_rates.as_deref().unwrap_or(&[44100, 48000]);
+                                    let fmt_for_pipeline = writer.fmt.as_ref().unwrap_or(&default_fmt);
+                                    let supported_fmts_for_pipeline = writer.supported_fmts.as_deref().unwrap_or(&["S32LE"]);
+                                    let supported_rates_for_pipeline = writer.supported_rates.as_deref().unwrap_or(&[44100, 48000]);
                                     let built = build_appsink_pipeline(
                                         &uri,
                                         is_dash,
@@ -2643,13 +2742,9 @@ impl AudioPlayer {
                                 }
                             } else {
                                 // ── Normal path (unchanged) ──
-                                // Shut down any lingering ALSA writer from a mode switch
-                                if let Some(tx) = writer_tx.take() {
-                                    tx.try_send(WriterCommand::Shutdown).ok();
-                                }
-                                if let Some(h) = writer_thread.take() {
-                                    h.join().ok();
-                                }
+                                // Shut down any lingering ALSA writer from a mode
+                                // switch, handing its card back to PipeWire
+                                writer.shutdown();
 
                                 let pipe = gst::Pipeline::new();
                                 watch_pipeline_sources(&pipe, route);
@@ -2997,7 +3092,7 @@ impl AudioPlayer {
                                         let frames_written = Arc::clone(&frames_written);
                                         let sample_rate = Arc::clone(&current_sample_rate);
                                         let paused = Arc::clone(&paused);
-                                        let writer_tx = writer_tx.clone();
+                                        let writer_tx = writer.tx.clone();
                                         std::thread::spawn(move || {
                                             let (ret, cur, pend) =
                                                 pipeline.state(gst::ClockTime::from_seconds(10));
@@ -3129,21 +3224,13 @@ impl AudioPlayer {
                                 if let Some(bus) = pipeline.bus() {
                                     bus.set_flushing(true);
                                 }
-                                if let Some(tx) = writer_tx.take() {
-                                    // Blocking, not a 200 ms timeout:
-                                    // the writer may be draining the DAC after a
-                                    // gapless boundary with a full channel, and a
-                                    // lost Shutdown kept the device open until every
-                                    // sender was dropped. `paused` is cleared above,
-                                    // and a dead writer makes this return at once.
-                                    let _ = tx.send(WriterCommand::Shutdown);
-                                }
+                                // `paused` is cleared above, so the writer can
+                                // take the Shutdown.
+                                writer.request_shutdown();
                                 pipeline.set_state(gst::State::Null).ok();
                                 let _ = pipeline.state(gst::ClockTime::from_mseconds(500));
                                 drop(pipeline);
-                                if let Some(h) = writer_thread.take() {
-                                    h.join().ok();
-                                }
+                                writer.shutdown();
                                 eos.store(false, Ordering::SeqCst);
                                 has_uri.store(false, Ordering::SeqCst);
                                 *decoded_cell_thread.lock().unwrap() = None;
@@ -3151,13 +3238,9 @@ impl AudioPlayer {
                                 Ok(())
                             }
                             None => {
-                                // Clean up orphaned writer (e.g. pipeline build failed after spawn)
-                                if let Some(tx) = writer_tx.take() {
-                                    let _ = tx.send(WriterCommand::Shutdown);
-                                }
-                                if let Some(h) = writer_thread.take() {
-                                    h.join().ok();
-                                }
+                                // Clean up orphaned writer (e.g. pipeline build failed
+                                // after spawn, or after a device error)
+                                writer.shutdown();
                                 Ok(())
                             }
                         };
@@ -3227,7 +3310,7 @@ impl AudioPlayer {
                                 paused.store(false, Ordering::Release);
                                 track_generation += 1;
                                 writer_gen.store(track_generation, Ordering::Release);
-                                if let Some(ref tx) = writer_tx {
+                                if let Some(ref tx) = writer.tx {
                                     let _ = tx.send(WriterCommand::Flush);
                                 }
                                 let pos = gst::ClockTime::from_nseconds(
@@ -3758,11 +3841,10 @@ impl AudioPlayer {
                     AudioCommand::DeviceRates { reply } => {
                         // While our writer holds the device, opening it again
                         // would fail: answer with what the writer probed.
-                        let writer_alive = writer_thread.as_ref().is_some_and(|h| !h.is_finished());
                         let result = match &device {
                             None => Err("no exclusive device is set".to_string()),
-                            Some(dev) if writer_alive && writer_device.as_ref() == Some(dev) => {
-                                Ok(writer_supported_rates.clone().unwrap_or_default())
+                            Some(dev) if writer.alive() && writer.device.as_ref() == Some(dev) => {
+                                Ok(writer.supported_rates.clone().unwrap_or_default())
                             }
                             Some(dev) => probe_device_rates(dev),
                         };
@@ -4747,5 +4829,86 @@ mod proxy_source_tests {
         for c in [Capability::Lossy, Capability::Dash] {
             assert_eq!(p.route_for(c).expect("direct is unaffected"), Route::NoProxy);
         }
+    }
+}
+
+#[cfg(test)]
+mod writer_slot_tests {
+    use super::*;
+    use crate::acquire::tests::fake_hold;
+    use std::time::Duration;
+
+    /// A slot whose fake writer thread takes Shutdown from its channel and
+    /// then stays alive, still closing its device, until `exit` is sent.
+    /// Returns the slot, the exit sender and a receiver told when Shutdown
+    /// arrived.
+    fn slot_with_a_closing_writer(
+        lease: Lease,
+    ) -> (WriterSlot, crossbeam_channel::Sender<()>, crossbeam_channel::Receiver<()>) {
+        let (tx, rx) = crossbeam_channel::bounded::<WriterCommand>(4);
+        let (exit_tx, exit_rx) = crossbeam_channel::bounded::<()>(0);
+        let (got_tx, got_rx) = crossbeam_channel::bounded::<()>(1);
+        let thread = std::thread::spawn(move || {
+            while let Ok(cmd) = rx.recv() {
+                if matches!(cmd, WriterCommand::Shutdown) {
+                    got_tx.send(()).ok();
+                    break;
+                }
+            }
+            exit_rx.recv().ok();
+        });
+        let mut writer = WriterSlot::default();
+        writer.tx = Some(tx);
+        writer.thread = Some(thread);
+        writer.device = Some("hw:CARD=DAC,DEV=0".into());
+        writer.lease = Some(lease);
+        (writer, exit_tx, got_rx)
+    }
+
+    #[test]
+    fn stop_after_a_device_error_releases_the_lease() {
+        // The writer hit a device error and is still closing the device when
+        // Stop comes: the card is handed back only once the thread is gone.
+        let (hold, released) = fake_hold();
+        let (mut writer, exit, got_shutdown) = slot_with_a_closing_writer(Lease::new(Some(1), Some(hold)));
+        let stopping = std::thread::spawn(move || {
+            writer.shutdown();
+            writer
+        });
+        got_shutdown.recv_timeout(Duration::from_secs(5)).expect("the writer gets Shutdown");
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(!released.load(Ordering::SeqCst), "released while the writer is alive");
+        exit.send(()).unwrap();
+        let writer = stopping.join().unwrap();
+        assert!(released.load(Ordering::SeqCst));
+        assert!(writer.thread.is_none() && writer.lease.is_none());
+
+        // With no writer at all, too.
+        let (hold, released) = fake_hold();
+        let mut writer = WriterSlot::default();
+        writer.lease = Some(Lease::new(Some(1), Some(hold)));
+        writer.shutdown();
+        assert!(released.load(Ordering::SeqCst));
+
+        // And when the slot is dropped without a Stop.
+        let (hold, released) = fake_hold();
+        let mut writer = WriterSlot::default();
+        writer.lease = Some(Lease::new(Some(1), Some(hold)));
+        drop(writer);
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn released_on_switch_to_system_default() {
+        // The Normal path shuts the exclusive writer down before building
+        // its pipeline; that hands the card back.
+        let (hold, released) = fake_hold();
+        let (mut writer, exit, got_shutdown) = slot_with_a_closing_writer(Lease::new(Some(1), Some(hold)));
+        // Let the writer exit as soon as it has Shutdown.
+        drop(exit);
+        writer.shutdown();
+        assert!(got_shutdown.try_recv().is_ok());
+        assert!(released.load(Ordering::SeqCst));
+        assert!(writer.tx.is_none() && writer.thread.is_none() && writer.lease.is_none());
     }
 }
