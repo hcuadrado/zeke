@@ -1010,7 +1010,9 @@ impl Core {
                 self.consecutive_fails = 0;
                 self.position = loading.start_at.unwrap_or(0.0);
                 self.track_seq += 1;
-                self.output_changed = false;
+                // A pick that came in while this track loaded still applies
+                // from the next one.
+                self.output_changed = loading.output != self.output_gen;
                 self.current = Some(Current {
                     duration: r.duration,
                     format: Some(r.format.clone()),
@@ -1839,6 +1841,23 @@ mod tests {
         let fx = h.send(Input::TrackFinished);
         let fx = h.finish_load(&fx, 200.0);
         assert_eq!(started(&fx), Some((2, Transition::AfterEnd)));
+    }
+
+    #[test]
+    fn an_output_change_while_loading_starts_the_next_track_fresh() {
+        let mut h = Harness::new();
+        h.cmd(PlayerCommand::Load { tracks: QueueTrack::from_ids(&[1, 2, 3]), start: Some(0), album_mode: false, shuffle: false, repeat: RepeatMode::Off });
+        h.send(Input::PlayResolved { load: h.core.load, result: Ok(resolved("1", 200.0)) });
+        // Picked while the Play for the old output is in flight.
+        h.cmd(PlayerCommand::SetOutput { exclusive: false, device: None, bit_perfect: false });
+        h.send(Input::PlayStarted { load: h.core.load, result: Ok(()) });
+        assert_eq!(h.core.state(), PlaybackState::Playing);
+        assert!(resolve_next(&h.send(Input::Tick { position: 190.0, track: h.core.track_seq() })).is_none());
+        let fx = h.send(Input::TrackFinished);
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(started(&fx), Some((2, Transition::AfterEnd)));
+        // That one opened the new output: the track after it may go gapless.
+        assert!(resolve_next(&h.send(Input::Tick { position: 190.0, track: h.core.track_seq() })).is_some());
     }
 
     #[test]
