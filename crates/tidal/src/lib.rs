@@ -21,6 +21,7 @@ use cache::DiskCache;
 use credential::{BoxFuture, Credential, CredentialSource, Refresh};
 use crypto::Crypto;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -113,6 +114,11 @@ pub struct Settings {
     pub proxy: ProxySettings,
     #[serde(default)]
     pub color_scheme: ColorScheme,
+    /// Each plugin's own entry, keyed by plugin id, in whatever shape the
+    /// plugin gives it. Opaque here, and kept whole by every save, so an
+    /// entry survives a build without its plugin and a token refresh.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -130,6 +136,7 @@ impl Default for Settings {
             volume_normalization: false,
             proxy: Default::default(),
             color_scheme: ColorScheme::System,
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -214,11 +221,15 @@ impl AppState {
     /// from the keyring, then `zeke.key`, or is generated (`crypto.rs`).
     pub fn new(config_dir: &Path) -> Result<Self, TidalError> {
         fs::create_dir_all(config_dir)?;
+        let crypto = Arc::new(Crypto::new(config_dir)?);
+        Self::with_crypto(config_dir, crypto)
+    }
+
+    fn with_crypto(config_dir: &Path, crypto: Arc<Crypto>) -> Result<Self, TidalError> {
         let settings_path = config_dir.join("settings.json");
         let cache_dir = config_dir.join("cache");
         fs::create_dir_all(&cache_dir)?;
 
-        let crypto = Arc::new(Crypto::new(config_dir)?);
         let disk_cache = DiskCache::new(&cache_dir, crypto.clone());
 
         let caps = proxy::HostCaps::assume_all_present();
@@ -381,5 +392,52 @@ mod settings_tests {
         assert!(crypto::is_encrypted(&raw), "settings must never be plaintext on disk");
         let back: Settings = serde_json::from_slice(&crypto.decrypt(&raw).unwrap()).unwrap();
         assert_eq!(back.auth_tokens.unwrap().refresh_token, "r");
+    }
+
+    fn state_with_a_plugin_entry() -> (tempfile::TempDir, AppState, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_crypto(dir.path(), Arc::new(Crypto::with_key([7u8; 32]))).unwrap();
+        let entry = serde_json::json!({ "enabled": true, "last": { "name": "Kitchen", "n": 3 } });
+        let saved = entry.clone();
+        state.update_settings(move |s| {
+            s.plugins.insert("cast".into(), saved);
+        })
+        .unwrap();
+        (dir, state, entry)
+    }
+
+    #[test]
+    fn a_plugin_entry_survives_a_settings_save() {
+        let (_dir, state, entry) = state_with_a_plugin_entry();
+        state.update_settings(|s| s.volume = 0.5).unwrap();
+        let s = state.load_settings().unwrap();
+        assert_eq!(s.volume, 0.5);
+        assert_eq!(s.plugins["cast"], entry);
+    }
+
+    #[test]
+    fn a_plugin_entry_survives_a_token_refresh() {
+        let (_dir, state, entry) = state_with_a_plugin_entry();
+        // What the client's persist hook does after every refresh: it
+        // rewrites the whole file.
+        let tokens = AuthTokens {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_in: 1,
+            token_type: "Bearer".into(),
+            user_id: Some(1),
+            obtained_at: 0,
+        };
+        persist_auth_tokens(&state.settings_path, &state.crypto, &tokens);
+        let s = state.load_settings().unwrap();
+        assert!(s.auth_tokens.is_some());
+        assert_eq!(s.plugins["cast"], entry);
+    }
+
+    #[test]
+    fn settings_without_plugins_load_with_none() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.plugins.is_empty());
+        assert!(Settings::default().plugins.is_empty());
     }
 }
