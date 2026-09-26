@@ -59,6 +59,17 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.2.0" date="2026-09-25">
+      <description>
+        <p>
+          An output menu in the player bar: play through the system default
+          or on a sound device exclusively, with bit-perfect playback per
+          device. Zeke takes the card from PipeWire when it plays and gives
+          it back afterwards, and falls back to the system default when the
+          device is busy.
+        </p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-09-25">
       <description>
         <p>

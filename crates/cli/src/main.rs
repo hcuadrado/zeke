@@ -93,19 +93,20 @@ struct OutputArgs {
     /// Quality ceiling (default: the saved max_quality)
     #[arg(long)]
     quality: Option<String>,
-    /// ALSA device for exclusive mode, e.g. hw:0,0 (default: the saved one)
+    /// ALSA device for exclusive mode, e.g. hw:0,0 (default: the saved output device)
     #[arg(long)]
     device: Option<String>,
-    /// Exclusive ALSA output (default: the saved setting, off)
+    /// Exclusive ALSA output (default: on when an output device is saved)
     #[arg(long, overrides_with = "no_exclusive")]
     exclusive: bool,
     /// Normal output through the system mixer (PipeWire)
     #[arg(long)]
     no_exclusive: bool,
-    /// Bit-perfect output: no resampling or format conversion
+    /// Bit-perfect output: no resampling or format conversion; needs exclusive
+    /// mode (default: the device's saved setting, when exclusive)
     #[arg(long, overrides_with = "no_bit_perfect")]
     bit_perfect: bool,
-    /// Resample and convert as needed (overrides a saved bit_perfect)
+    /// Resample and convert as needed (overrides the device's saved setting)
     #[arg(long)]
     no_bit_perfect: bool,
     /// Stop after this many seconds
@@ -116,15 +117,16 @@ struct OutputArgs {
 impl OutputArgs {
     /// These flags over the saved settings.
     fn resolve(self, saved: &Settings) -> PlayOptions {
+        let device = self.device.or(saved.output_device.clone());
+        let exclusive = !self.no_exclusive && (self.exclusive || saved.output_device.is_some());
+        let bit_perfect = !self.no_bit_perfect
+            && (self.bit_perfect
+                || (exclusive && device.as_deref().is_some_and(|d| saved.bit_perfect_on(d))));
         PlayOptions {
             quality: self.quality.unwrap_or(saved.max_quality.clone()),
-            device: self.device.or(saved.exclusive_device.clone()),
-            exclusive: if self.no_exclusive {
-                false
-            } else {
-                self.exclusive || saved.exclusive_mode
-            },
-            bit_perfect: !self.no_bit_perfect && (self.bit_perfect || saved.bit_perfect),
+            device,
+            exclusive,
+            bit_perfect,
             stop_after: self.stop_after.map(Duration::from_secs),
         }
     }
@@ -696,6 +698,18 @@ async fn play_queue(state: Arc<AppState>, mut q: QueueOptions, opts: PlayOptions
                         log::error!("[player] stopped on error ({kind:?}): {message}");
                         break Err(message);
                     }
+                    PlayerEvent::OutputFellBack { device } => log::warn!(
+                        "[player] {} is busy: playing on the system default",
+                        device.as_deref().unwrap_or("the default exclusive device")
+                    ),
+                    PlayerEvent::OutputActive { exclusive, device } => log::info!(
+                        "[player] output: {}",
+                        match (exclusive, device.as_deref()) {
+                            (false, _) => "system default".to_string(),
+                            (true, Some(d)) => format!("{d} (exclusive)"),
+                            (true, None) => "default device (exclusive)".to_string(),
+                        }
+                    ),
                 },
                 Ok(Update::Engine(EngineEvent::SignalPathChanged(p))) => {
                     let line = signal_path_line(&p);

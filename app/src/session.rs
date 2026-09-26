@@ -13,7 +13,7 @@ use gtk::glib;
 use zeke_engine::audio::{self, AudioDevice, AudioPlayer};
 use zeke_engine::events::{self, EngineEvent};
 use zeke_engine::pipeline_probe::PipelineProbe;
-use zeke_engine::{devices, SignalPath, SignalPathTracker};
+use zeke_engine::{acquire, devices, reserve, SignalPath, SignalPathTracker};
 use zeke_player::{
     Config, ErrorKind, PersistedQueue, PlaybackState, Player, PlayerCommand, PlayerConfig, PlayerEvent, QueueItem,
     RepeatMode, StreamFormat, TrackInfo, Transition, Update,
@@ -118,8 +118,16 @@ pub enum UiEvent {
     Notice(String),
     /// A stream couldn't be resolved because the login expired.
     LoginExpired,
-    /// The exclusive device was picked automatically at startup.
-    DeviceChosen(String),
+    /// The saved output device couldn't be used at startup and was
+    /// replaced by the system default (already saved).
+    OutputReset(String),
+    /// The output device (`None`: exclusive without one) was busy, and the
+    /// track plays on the system default instead.
+    OutputFellBack(Option<String>),
+    /// The output the playing track opened; `None` is the system default.
+    OutputActive(Option<String>),
+    /// The output devices, listed at startup.
+    OutputsListed(Vec<AudioDevice>),
     /// From MPRIS: bring the window up, quit, set the volume.
     Raise,
     Quit,
@@ -257,17 +265,35 @@ impl Session {
         self.change_settings(move |s| s.max_quality = quality.clone());
     }
 
-    /// `device: None` keeps the saved device (e.g. before the list loaded).
-    pub fn set_output(&self, exclusive: bool, device: Option<String>, bit_perfect: bool) {
-        let device = device.or_else(|| self.settings.borrow().exclusive_device.clone());
-        self.send(PlayerCommand::SetOutput { exclusive, device: device.clone(), bit_perfect });
-        self.change_settings(move |s| {
-            s.exclusive_mode = exclusive;
-            if device.is_some() {
-                s.exclusive_device = device.clone();
-            }
-            s.bit_perfect = bit_perfect;
-        });
+    /// The saved output device; `None` is the system default.
+    pub fn output(&self) -> Option<String> {
+        self.settings.borrow().output_device.clone()
+    }
+
+    /// Play from the next track on `device` (`None`: the system default).
+    pub fn select_output(&self, device: Option<String>) {
+        if self.output() == device {
+            return;
+        }
+        self.send(output_command(&self.settings.borrow(), device.clone()));
+        self.change_settings(move |s| s.output_device = device.clone());
+    }
+
+    /// Save `device`'s bit-perfect flag. On the saved device it applies
+    /// from the next track.
+    pub fn set_device_bit_perfect(&self, device: &str, on: bool) {
+        let id = device.to_string();
+        self.change_settings(move |s| s.set_bit_perfect_on(&id, on));
+        if self.output().as_deref() == Some(device) {
+            self.send(output_command(&self.settings.borrow(), Some(device.to_string())));
+        }
+    }
+
+    /// `device` was busy and the player switched to the system default:
+    /// save that, unless another device was picked since.
+    pub fn output_fell_back(&self, device: &str) {
+        let device = device.to_string();
+        self.change_settings(move |s| clear_output_if(s, &device));
     }
 
     pub fn set_gapless(&self, on: bool) {
@@ -280,13 +306,60 @@ impl Session {
         self.change_settings(move |s| s.volume_normalization = on);
     }
 
-    /// Record the device picked at startup (already applied to the player).
-    pub fn device_chosen(&self, device: String) {
-        self.settings.borrow_mut().exclusive_device = Some(device);
+    /// The startup check replaced `device` with the system default.
+    pub fn output_reset(&self, device: &str) {
+        clear_output_if(&mut self.settings.borrow_mut(), device);
     }
 }
 
-/// ALSA playback devices for the preferences, with stable ids
+/// The command that makes `device` the output: `None` is the system
+/// default, never exclusive; a device is always exclusive, bit-perfect as
+/// saved for it.
+fn output_command(settings: &Settings, device: Option<String>) -> PlayerCommand {
+    let bit_perfect = device.as_deref().is_some_and(|d| settings.bit_perfect_on(d));
+    PlayerCommand::SetOutput { exclusive: device.is_some(), device, bit_perfect }
+}
+
+/// Back to the system default, unless the saved output changed since
+/// `device` was picked.
+fn clear_output_if(settings: &mut Settings, device: &str) {
+    if settings.output_device.as_deref() == Some(device) {
+        settings.output_device = None;
+    }
+}
+
+/// The output to start on: the saved device, or `Err(why)` when it has to
+/// be replaced by the system default. A free device is kept, and so is one
+/// PipeWire holds under a reservation Zeke can take when it plays (see
+/// `reserve::startup_takeable`). Anything else busy, or a device that can't
+/// be opened, is replaced. `probe` only opens and closes: nothing is taken
+/// from other apps here.
+fn startup_output(
+    saved: Option<String>,
+    probe: impl FnOnce(&str) -> Result<(), String>,
+    takeable: impl FnOnce(&str) -> bool,
+    holder: impl FnOnce(&str) -> Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(device) = saved else { return Ok(None) };
+    match probe(&device) {
+        Ok(()) => Ok(Some(device)),
+        Err(e) if e == acquire::DEVICE_BUSY => {
+            if takeable(&device) {
+                return Ok(Some(device));
+            }
+            Err(match holder(&device) {
+                Some(comm) if comm == "pipewire" => {
+                    format!("{device} is busy at startup: PipeWire holds it under a reservation Zeke can’t take")
+                }
+                Some(comm) => format!("{device} is busy at startup (held by {comm})"),
+                None => format!("{device} is busy at startup"),
+            })
+        }
+        Err(e) => Err(format!("{device} can’t be opened (missing?): {e}")),
+    }
+}
+
+/// ALSA playback devices for the output picker, with stable ids
 /// (`hw:CARD=<id>,DEV=<n>`). Blocks for up to ~2 s: run it off the main thread.
 pub fn list_devices() -> Result<Vec<AudioDevice>, String> {
     let mut out: Vec<AudioDevice> = Vec::new();
@@ -347,7 +420,6 @@ async fn run(
                 gapless: settings.gapless,
                 normalization: settings.volume_normalization,
                 max_quality: settings.max_quality.clone(),
-                bit_perfect: settings.exclusive_mode && settings.bit_perfect,
                 ..Config::default()
             },
             seed: None,
@@ -355,20 +427,42 @@ async fn run(
         },
     );
 
-    let device = match settings.exclusive_device.clone().filter(|d| !d.is_empty()) {
-        None => pick_device(&state, &ui).await,
-        // Names saved by early builds (`hw:0,0`) move to the stable form.
-        Some(saved) => match devices::stable_name(&saved).filter(|stable| *stable != saved) {
-            Some(stable) => {
-                log::info!("[app] exclusive device {saved} is now saved as {stable}");
-                save_device(&state, &ui, stable.clone()).await;
-                Some(stable)
-            }
-            None => Some(saved),
-        },
+    let saved = settings.output_device.clone();
+    let checked = {
+        let saved = saved.clone();
+        tokio::task::spawn_blocking(move || {
+            startup_output(saved, audio::probe_device, reserve::startup_takeable, reserve::pcm_holder)
+        })
+        .await
     };
+    let device = match checked {
+        Ok(Ok(device)) => device,
+        // The check itself failed: keep the saved device.
+        Err(_) => saved,
+        Ok(Err(why)) => {
+            log::warn!("[app] {why}; using System Default");
+            if let Some(saved) = saved {
+                forget_output(&state, &ui, saved).await;
+            }
+            None
+        }
+    };
+    // List the devices once before the first track can take a card: while
+    // Zeke holds a card exclusively, PipeWire no longer lists its devices.
+    tokio::spawn({
+        let ui = ui.clone();
+        async move {
+            match tokio::task::spawn_blocking(list_devices).await {
+                Ok(Ok(list)) => {
+                    let _ = ui.send(UiEvent::OutputsListed(list)).await;
+                }
+                Ok(Err(e)) => log::warn!("[app] listing devices: {e}"),
+                Err(e) => log::warn!("[app] listing devices: {e}"),
+            }
+        }
+    });
     for command in [
-        PlayerCommand::SetOutput { exclusive: settings.exclusive_mode, device, bit_perfect: settings.bit_perfect },
+        output_command(&settings, device),
         PlayerCommand::SetGapless(settings.gapless),
         PlayerCommand::SetVolume(settings.volume),
     ] {
@@ -417,33 +511,16 @@ async fn load_queue(path: std::path::PathBuf) -> Option<PersistedQueue> {
     }
 }
 
-/// Pick the first analog device, save it, and tell the UI.
-async fn pick_device(state: &Arc<AppState>, ui: &async_channel::Sender<UiEvent>) -> Option<String> {
-    let picked = tokio::task::spawn_blocking(|| {
-        let list = audio::list_alsa_devices().inspect_err(|e| log::warn!("[app] listing devices: {e}")).ok()?;
-        devices::pick_default_device(&list)
-    })
-    .await
-    .ok()
-    .flatten();
-    let Some(device) = picked else {
-        log::warn!("[app] no analog playback device found for exclusive mode");
-        return None;
-    };
-    log::info!("[app] exclusive device not set; picked {device}");
-    save_device(state, ui, device.clone()).await;
-    Some(device)
-}
-
-/// Save a device chosen at startup and tell the UI's copy of the settings.
-/// Runs before the UI can change the output (it has no device list yet).
-async fn save_device(state: &Arc<AppState>, ui: &async_channel::Sender<UiEvent>, device: String) {
-    let (state, saved) = (Arc::clone(state), device.clone());
-    let result = tokio::task::spawn_blocking(move || state.update_settings(|s| s.exclusive_device = Some(saved))).await;
+/// Save the system default in place of `device`, which failed the startup
+/// check, and tell the UI's copy of the settings. A pick made meanwhile is
+/// kept.
+async fn forget_output(state: &Arc<AppState>, ui: &async_channel::Sender<UiEvent>, device: String) {
+    let (state, failed) = (Arc::clone(state), device.clone());
+    let result = tokio::task::spawn_blocking(move || state.update_settings(|s| clear_output_if(s, &failed))).await;
     if let Ok(Err(e)) = result {
-        log::error!("[app] saving the exclusive device failed: {}", e.log_safe());
+        log::error!("[app] saving the output failed: {}", e.log_safe());
     }
-    let _ = ui.send(UiEvent::DeviceChosen(device)).await;
+    let _ = ui.send(UiEvent::OutputReset(device)).await;
 }
 
 /// Metadata requests beyond the current track: this many upcoming tracks
@@ -607,6 +684,15 @@ async fn hub(
             Update::Player(PlayerEvent::PrefetchFailed { item, error }) => {
                 log::warn!("[app] could not resolve next track {}: {error}", item.track_id);
             }
+            Update::Player(PlayerEvent::OutputFellBack { device }) => {
+                log::warn!("[app] {} is busy; playing on System Default", device.as_deref().unwrap_or("the device"));
+                let _ = ui.send(UiEvent::OutputFellBack(device)).await;
+            }
+            Update::Player(PlayerEvent::OutputActive { exclusive, device }) => {
+                let device = device.filter(|_| exclusive);
+                log::info!("[app] output: {}", device.as_deref().unwrap_or("System Default"));
+                let _ = ui.send(UiEvent::OutputActive(device)).await;
+            }
             Update::Engine(EngineEvent::SignalPathChanged(p)) => {
                 let _ = ui.send(UiEvent::SignalPath(p)).await;
             }
@@ -710,5 +796,67 @@ mod tests {
         assert_eq!(&wants[..3], &[101, 104, 105], "cached and just-failed ids are skipped");
         assert_eq!(wants.len(), 1 + (META_AHEAD - 2) + META_BEHIND);
         assert_eq!(wants[wants.len() - META_BEHIND], 100, "history nearest first");
+    }
+
+    const DAC: &str = "hw:CARD=DAC,DEV=0";
+
+    fn busy(_: &str) -> Result<(), String> {
+        Err(acquire::DEVICE_BUSY.into())
+    }
+
+    fn untouched<T>(_: &str) -> T {
+        panic!("not asked")
+    }
+
+    #[test]
+    fn startup_keeps_a_free_saved_device() {
+        let out = startup_output(Some(DAC.into()), |_| Ok(()), untouched, untouched);
+        assert_eq!(out, Ok(Some(DAC.into())));
+    }
+
+    #[test]
+    fn startup_falls_back_when_missing() {
+        let out = startup_output(Some(DAC.into()), |_| Err("Failed to open ALSA device: No such device".into()), untouched, untouched);
+        let why = out.unwrap_err();
+        assert!(why.contains("can’t be opened") && why.contains(DAC), "{why}");
+    }
+
+    #[test]
+    fn startup_falls_back_on_raw_alsa_holder() {
+        let out = startup_output(Some(DAC.into()), busy, |_| false, |_| Some("aplay".into()));
+        assert_eq!(out, Err(format!("{DAC} is busy at startup (held by aplay)")));
+    }
+
+    #[test]
+    fn startup_keeps_device_held_by_lower_priority_owner() {
+        let out = startup_output(Some(DAC.into()), busy, |_| true, untouched);
+        assert_eq!(out, Ok(Some(DAC.into())));
+    }
+
+    #[test]
+    fn startup_with_no_saved_device_uses_system_default() {
+        assert_eq!(startup_output(None, untouched, untouched, untouched), Ok(None));
+    }
+
+    #[test]
+    fn output_command_for_system_default_and_devices() {
+        let mut s = Settings::default();
+        s.set_bit_perfect_on(DAC, true);
+        let output = |device: Option<&str>| match output_command(&s, device.map(Into::into)) {
+            PlayerCommand::SetOutput { exclusive, device, bit_perfect } => (exclusive, device, bit_perfect),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(output(None), (false, None, false));
+        assert_eq!(output(Some(DAC)), (true, Some(DAC.into()), true));
+        assert_eq!(output(Some("hw:CARD=PCH,DEV=3")), (true, Some("hw:CARD=PCH,DEV=3".into()), false));
+    }
+
+    #[test]
+    fn a_fallback_clears_only_the_device_that_failed() {
+        let mut s = Settings { output_device: Some(DAC.into()), ..Settings::default() };
+        clear_output_if(&mut s, "hw:CARD=PCH,DEV=3");
+        assert_eq!(s.output_device.as_deref(), Some(DAC));
+        clear_output_if(&mut s, DAC);
+        assert_eq!(s.output_device, None);
     }
 }

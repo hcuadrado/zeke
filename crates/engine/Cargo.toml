@@ -16,4 +16,5 @@ libc = "0.2"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+zbus = "5"
 zeke-tidal = { path = "../tidal" }

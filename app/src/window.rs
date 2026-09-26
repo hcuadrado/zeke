@@ -111,6 +111,12 @@ mod imp {
         #[template_child]
         pub bar_volume: TemplateChild<gtk::Scale>,
         #[template_child]
+        pub output_button: TemplateChild<gtk::MenuButton>,
+        #[template_child]
+        pub output_popover: TemplateChild<gtk::Popover>,
+        #[template_child]
+        pub output_list: TemplateChild<gtk::ListBox>,
+        #[template_child]
         pub bar_heart: TemplateChild<gtk::Button>,
         #[template_child]
         pub sheet_heart: TemplateChild<gtk::Button>,
@@ -147,6 +153,13 @@ mod imp {
         /// Bumped whenever the queue is replaced: a page still loading the
         /// queue it started appends the rest only while this is unchanged.
         pub queue_generation: Cell<u64>,
+        /// The output devices as last listed.
+        pub output_devices: RefCell<Vec<zeke_engine::audio::AudioDevice>>,
+        /// Set while the devices are being listed.
+        pub listing_outputs: Cell<bool>,
+        /// The output the playing track opened (`Some(None)`: the system
+        /// default); `None` until a track has played.
+        pub active_output: RefCell<Option<Option<String>>>,
     }
 
     #[glib::object_subclass]
@@ -195,6 +208,7 @@ impl ZekeWindow {
         window.setup_actions();
         window.setup_playback_keys();
         window.setup_player_view();
+        window.setup_output_picker();
         window.setup_browse();
         window.listen(events);
         if logged_in {
@@ -360,9 +374,21 @@ impl ZekeWindow {
             UiEvent::Error(e) => self.toast(&e),
             UiEvent::LoginExpired => self.login_expired(),
             UiEvent::Notice(n) => self.toast(&n),
-            UiEvent::DeviceChosen(device) => {
-                log::info!("[app] using {device} for exclusive mode");
-                self.session().device_chosen(device);
+            UiEvent::OutputReset(device) => {
+                self.session().output_reset(&device);
+                self.refresh_outputs();
+            }
+            UiEvent::OutputFellBack(device) => {
+                if let Some(device) = &device {
+                    self.session().output_fell_back(device);
+                }
+                self.toast(&crate::errors::fell_back(device.map(|d| self.output_label(Some(&d))).as_deref()));
+                self.refresh_outputs();
+            }
+            UiEvent::OutputsListed(list) => self.outputs_listed(list),
+            UiEvent::OutputActive(device) => {
+                imp.active_output.replace(Some(device));
+                self.refresh_outputs();
             }
             UiEvent::Raise => self.present(),
             UiEvent::Quit => {

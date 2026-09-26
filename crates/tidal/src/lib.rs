@@ -95,16 +95,14 @@ pub struct Settings {
     pub volume: f32,
     #[serde(default = "defaults::max_quality")]
     pub max_quality: String,
-    /// Off by default: playback goes through the system mixer (PipeWire)
-    /// unless the user opts into exclusive ALSA in Preferences.
+    /// The ALSA device played exclusively, stored as `hw:CARD=<id>,DEV=<n>`,
+    /// which survives card renumbering. None, the default, is the system
+    /// mixer (PipeWire).
     #[serde(default)]
-    pub exclusive_mode: bool,
-    /// Stored as `hw:CARD=<id>,DEV=<n>`, which survives card renumbering.
-    /// Empty: the app picks the first analog device at startup.
+    pub output_device: Option<String>,
+    /// Devices, in the same form, that play bit-perfect.
     #[serde(default)]
-    pub exclusive_device: Option<String>,
-    #[serde(default)]
-    pub bit_perfect: bool,
+    pub bit_perfect_devices: Vec<String>,
     #[serde(default = "defaults::yes")]
     pub gapless: bool,
     #[serde(default)]
@@ -124,13 +122,25 @@ impl Default for Settings {
             client_secret: String::new(),
             volume: 1.0,
             max_quality: defaults::max_quality(),
-            exclusive_mode: false,
-            exclusive_device: None,
-            bit_perfect: false,
+            output_device: None,
+            bit_perfect_devices: Vec::new(),
             gapless: true,
             volume_normalization: false,
             proxy: Default::default(),
             color_scheme: ColorScheme::System,
+        }
+    }
+}
+
+impl Settings {
+    pub fn bit_perfect_on(&self, device: &str) -> bool {
+        self.bit_perfect_devices.iter().any(|d| d == device)
+    }
+
+    pub fn set_bit_perfect_on(&mut self, device: &str, on: bool) {
+        self.bit_perfect_devices.retain(|d| d != device);
+        if on {
+            self.bit_perfect_devices.push(device.to_owned());
         }
     }
 }
@@ -271,13 +281,44 @@ mod settings_tests {
     #[test]
     fn audio_defaults_are_normal_output_without_bit_perfect() {
         for s in [Settings::default(), serde_json::from_str::<Settings>("{}").unwrap()] {
-            assert!(!s.exclusive_mode);
-            assert!(!s.bit_perfect);
+            assert_eq!(s.output_device, None);
+            assert!(s.bit_perfect_devices.is_empty());
             assert!(s.gapless);
             assert_eq!(s.max_quality, "HI_RES_LOSSLESS");
             assert_eq!(s.auth_method, AuthMethod::LoginCode);
             assert_eq!(s.color_scheme, ColorScheme::System);
         }
+    }
+
+    // The output fields of earlier versions are dropped, not carried over:
+    // everyone starts on the system mixer.
+    #[test]
+    fn old_output_fields_are_ignored() {
+        let json = r#"{
+            "exclusive_mode": true,
+            "exclusive_device": "hw:CARD=DAC,DEV=0",
+            "bit_perfect": true
+        }"#;
+        let s: Settings = serde_json::from_str(json).unwrap();
+        assert_eq!(s.output_device, None);
+        assert!(s.bit_perfect_devices.is_empty());
+    }
+
+    #[test]
+    fn bit_perfect_is_per_device() {
+        let (dac, hdmi) = ("hw:CARD=DAC,DEV=0", "hw:CARD=HDMI,DEV=3");
+        let mut s = Settings::default();
+        s.set_bit_perfect_on(dac, true);
+        s.set_bit_perfect_on(dac, true);
+        assert!(s.bit_perfect_on(dac));
+        assert!(!s.bit_perfect_on(hdmi));
+        assert_eq!(s.bit_perfect_devices, [dac]);
+
+        s.set_bit_perfect_on(hdmi, true);
+        s.set_bit_perfect_on(dac, false);
+        assert!(!s.bit_perfect_on(dac));
+        assert!(s.bit_perfect_on(hdmi));
+        assert_eq!(s.bit_perfect_devices, [hdmi]);
     }
 
     #[test]

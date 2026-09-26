@@ -87,18 +87,28 @@ pub fn stable_name(device: &str) -> Option<String> {
     stable_name_with(device, &cards)
 }
 
+/// The card number of a `hw`-family name, looking card ids up in `cards`
+/// (the contents of `/proc/asound/cards`).
+fn card_index_with(device: &str, cards: &str) -> Option<u32> {
+    match parse_hw(device)?.0 {
+        CardRef::Index(n) => Some(n),
+        CardRef::Id(id) => parse_cards(cards).into_iter().find(|(_, c)| *c == id).map(|(n, _)| n),
+    }
+}
+
+/// The card number of a `hw`-family name (`hw:CARD=DAC,DEV=0` → 1), or
+/// `None` if it isn't one or its card is not present.
+pub fn card_index(device: &str) -> Option<u32> {
+    match parse_hw(device)?.0 {
+        CardRef::Index(n) => Some(n),
+        CardRef::Id(_) => card_index_with(device, &std::fs::read_to_string("/proc/asound/cards").ok()?),
+    }
+}
+
 /// The `/proc/asound` directory of a `hw`-family name's card (`card0`), which
 /// holds its PCMs' `info` and `hw_params`.
 pub fn proc_card_dir(device: &str) -> Option<String> {
-    let (card, _) = parse_hw(device)?;
-    let index = match card {
-        CardRef::Index(n) => n,
-        CardRef::Id(id) => {
-            let cards = std::fs::read_to_string("/proc/asound/cards").ok()?;
-            parse_cards(&cards).into_iter().find(|(_, c)| *c == id)?.0
-        }
-    };
-    Some(format!("/proc/asound/card{index}"))
+    card_index(device).map(|index| format!("/proc/asound/card{index}"))
 }
 
 /// The `id:` line of a PCM's `/proc/asound/cardN/pcmDp/info`, e.g.
@@ -174,6 +184,16 @@ mod tests {
         );
         assert_eq!(stable_name_with("hw:7,0", CARDS), None, "no such card");
         assert_eq!(stable_name_with("default", CARDS), None);
+    }
+
+    #[test]
+    fn card_index_resolves_ids_and_numbers() {
+        assert_eq!(card_index_with("hw:CARD=DAC,DEV=0", CARDS), Some(1));
+        assert_eq!(card_index_with("hw:sofhdadsp,3", CARDS), Some(0));
+        assert_eq!(card_index_with("hw:0,3", CARDS), Some(0));
+        assert_eq!(card_index_with("hw:7,0", ""), Some(7), "numbers need no lookup");
+        assert_eq!(card_index_with("hw:CARD=Nope,DEV=0", CARDS), None, "unknown id");
+        assert_eq!(card_index_with("default", CARDS), None);
     }
 
     #[test]

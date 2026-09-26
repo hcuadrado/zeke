@@ -796,6 +796,43 @@ template $ZekeWindow: Adw.ApplicationWindow {
               spacing: 6;
               valign: center;
 
+              MenuButton output_button {
+                icon-name: "speaker-symbolic";
+
+                styles [
+                  "flat",
+                  "circular",
+                ]
+
+                popover: Popover output_popover {
+                  child: Box {
+                    orientation: vertical;
+                    spacing: 10;
+                    margin-top: 6;
+                    margin-bottom: 6;
+                    margin-start: 6;
+                    margin-end: 6;
+
+                    Label {
+                      label: "Output";
+                      xalign: 0;
+
+                      styles [
+                        "heading",
+                      ]
+                    }
+
+                    ListBox output_list {
+                      selection-mode: none;
+
+                      styles [
+                        "boxed-list",
+                      ]
+                    }
+                  };
+                };
+              }
+
               Image {
                 icon-name: "audio-volume-high-symbolic";
               }

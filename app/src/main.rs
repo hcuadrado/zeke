@@ -10,6 +10,7 @@ mod login;
 mod login_window;
 mod mpris;
 mod now_playing;
+mod output_picker;
 mod preferences;
 mod queue_row;
 mod runtime;

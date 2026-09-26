@@ -1,7 +1,5 @@
-<h1 align="center">Zeke</h1>
-
 <p align="center">
-  <img src="data/icons/128/io.github.hcuadrado.Zeke.png" alt="Zeke icon" width="128" height="128">
+  <img src="data/icons/256/io.github.hcuadrado.Zeke.png" alt="Zeke icon" width="256" height="256">
 </p>
 
 A native Linux TIDAL player for hi-res lossless playback (up to 24-bit/192 kHz,
@@ -21,9 +19,10 @@ MVP: the core player is complete. What it does today:
   and refreshed.
 - **Browse:** the personalized Home feed, search, favorites (tracks,
   albums, artists, playlists), and album, playlist, artist and mix pages.
-- **Playback:** gapless, up to 24-bit/192 kHz, with a quality cap, an
-  output device picker, optional exclusive (bit-perfect) ALSA output and
-  ReplayGain.
+- **Playback:** gapless, up to 24-bit/192 kHz, with a quality cap,
+  ReplayGain, and an output menu in the player bar: the system default or
+  a sound device played exclusively, bit-perfect if you like (see
+  [Audio output](#audio-output)).
 - **Queue:** shuffle, repeat and seek; a now-playing sheet; the queue is
   saved across restarts. Long playlists start playing before they have
   fully loaded.
@@ -36,6 +35,35 @@ MVP: the core player is complete. What it does today:
 - Animated covers
 - Video playback
 
+## Audio output
+
+The speaker button in the player bar chooses where Zeke plays. A choice
+applies from the next track.
+
+- **System Default** plays through the desktop's sound server (PipeWire),
+  like any other app. It shares the card with other apps, follows the
+  output chosen in the system settings, and PipeWire mixes and resamples
+  as needed.
+- **A device** (an ALSA hw device such as `hw:CARD=sofhdadsp,DEV=0`) is
+  played exclusively. Zeke writes to the card directly, with no mixing,
+  and with that device's Bit-perfect switch on, with no resampling or
+  format conversion either. While it plays, no other app can use the
+  card: on a laptop with a single card the system shows "Dummy Output".
+  Speakers and the headphone jack are usually the same device.
+
+**How Zeke takes the card:** PipeWire keeps a card open for as long as it
+owns the card's `org.freedesktop.ReserveDevice1` D-Bus name. Before
+opening a device, Zeke queues for that name and asks WirePlumber to
+release it, and the bus hands the name to Zeke as WirePlumber lets the
+card go. Zeke keeps the card until you switch back to System Default,
+stop or quit.
+
+**When the card is busy:** if another app has the card open directly (for
+example `aplay` or JACK), Zeke says so, switches to System Default and
+plays the track there. The saved device is also checked at startup: if
+it's missing or another app holds it directly, Zeke starts on System
+Default.
+
 ## Layout
 
 | Path | Role |
@@ -46,12 +74,14 @@ MVP: the core player is complete. What it does today:
 | `crates/cli` | headless test tool |
 | `app` | GTK4 + libadwaita application |
 
-## Building (openSUSE)
+## Building (openSUSE Tumbleweed/Slowroll)
 
 ```sh
 sudo zypper in gtk4-devel libadwaita-devel gstreamer-devel gstreamer-plugins-base-devel \
   gstreamer-plugins-good gstreamer-plugins-bad gstreamer-utils alsa-devel blueprint-compiler \
-  webkitgtk4-devel libsoup-devel
+  webkitgtk4-devel libsoup-devel rustup
+rustup default stable
+rustup component add rust-analyzer rust-src # Optional but recommended
 cargo run -p zeke
 ```
 

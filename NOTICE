@@ -32,3 +32,8 @@ crates/tidal/src/commands/pages.rs     commands/pages.rs
 crates/engine/src/audio.rs             audio.rs
 crates/engine/src/signal_path.rs       signal_path.rs
 crates/engine/src/pipeline_probe.rs    pipeline_probe.rs
+
+app/data/icons/scalable/actions/speaker-symbolic.svg is the "speaker"
+icon from Google's Material Symbols
+(https://github.com/google/material-design-icons), licensed under the
+Apache License 2.0.
