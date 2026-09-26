@@ -3462,6 +3462,7 @@ dependencies = [
  "log",
  "serde",
  "serde_json",
+ "zbus 5.19.0",
  "zeke-tidal",
 ]
 

@@ -7,6 +7,7 @@ pub mod audio;
 pub mod devices;
 pub mod events;
 pub mod pipeline_probe;
+pub mod reserve;
 pub mod signal_path;
 
 // audio.rs names these as `crate::proxy::…` and `crate::ProxySettings`;
