@@ -1239,11 +1239,13 @@ pub fn probe_device(device: &str) -> Result<(), String> {
 ///
 /// Runs on the audio thread, so Stop, Pause and every other command queue
 /// behind it. It normally takes milliseconds, but each bus call can block up
-/// to 2 s when the bus or the card's owner hangs. A takeover is up to six
-/// calls (asking for the name, reading the owner's name for the log, and
-/// two rounds of release and replace), about 12 s, and the previous owner
-/// then gets up to 1 s to close the PCM. Giving the name back after a
-/// failure adds up to two more calls.
+/// to 2 s when the bus or the card's owner hangs. A takeover asks for the
+/// name and reads the owner's name for the log, then makes up to two
+/// attempts: a release request, up to 0.2 s of checks for the owner to hand
+/// the name over (one more check can run past that), and a request to
+/// replace it. That is about 16 s at worst, and the previous owner then
+/// gets up to 1 s to close the PCM. Giving the name back after a failure
+/// adds up to two more calls.
 #[cfg(target_os = "linux")]
 fn acquire_device(device: &str, held: Option<Hold>) -> Result<(alsa::PCM, Lease), String> {
     let card = crate::devices::card_index(device);

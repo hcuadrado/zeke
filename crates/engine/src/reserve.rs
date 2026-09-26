@@ -10,7 +10,7 @@
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use zbus::blocking::Connection;
 use zbus::fdo::{RequestNameFlags, RequestNameReply};
@@ -24,6 +24,12 @@ pub const RESERVE_PRIORITY: i32 = 10;
 /// How many times the name is asked for after the owner agreed to release
 /// it, since the owner may take it back first.
 const MAX_TAKEOVER_ATTEMPTS: u32 = 2;
+/// How long an owner that agreed to release the name gets to hand it over
+/// before it is replaced. WirePlumber has always handed it over by the
+/// first check; the rest is margin for a busy WirePlumber.
+const RELEASE_WAIT: Duration = Duration::from_millis(200);
+/// How often the name is checked meanwhile.
+const RELEASE_POLL: Duration = Duration::from_millis(20);
 /// The longest a bus call may take.
 const METHOD_TIMEOUT: Duration = Duration::from_secs(2);
 const INTERFACE: &str = "org.freedesktop.ReserveDevice1";
@@ -40,27 +46,32 @@ fn object_path(card: u32) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NameReply {
     PrimaryOwner,
-    Exists,
+    /// Owned by someone else; we are next in line for it.
+    InQueue,
     Other,
 }
 
 /// The bus calls of the protocol, behind a trait so [`negotiate`] is tested
 /// without a bus.
 trait Bus {
-    /// `RequestName` with `DoNotQueue`, plus `ReplaceExisting` when
-    /// `replace`. Never `AllowReplacement`: the name is only given up by
-    /// dropping the hold.
+    /// `RequestName`, queueing for the name if it is owned, plus
+    /// `ReplaceExisting` when `replace`. Never `AllowReplacement`: the name is
+    /// only given up by dropping the hold.
     fn request_name(&self, name: &str, replace: bool) -> Result<NameReply, String>;
     /// `RequestRelease(priority)` on the name's owner.
     fn request_release(&self, name: &str, path: &str, priority: i32) -> Result<bool, String>;
+    /// Give the name up, or leave its queue.
     fn release_name(&self, name: &str) -> Result<(), String>;
+    /// Whether the name is ours now.
+    fn owns(&self, name: &str) -> Result<bool, String>;
     /// The owner's `ApplicationName`, for the log.
     fn owner_app(&self, _name: &str, _path: &str) -> Option<String> {
         None
     }
 }
 
-/// How asking for a name ended.
+/// How asking for a name ended. On `Refused` and `Failed` we may still be
+/// in the name's queue: the caller releases it.
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
     Free,
@@ -70,12 +81,17 @@ enum Outcome {
 }
 
 /// Take `name`: at once if no one owns it, else by asking the owner to
-/// release it and replacing it. The owner may win the name back between its
-/// release and our request, so that is tried [`MAX_TAKEOVER_ATTEMPTS`] times.
-fn negotiate(bus: &dyn Bus, name: &str, path: &str) -> Outcome {
+/// release it. We queue for the name first, so when the owner lets go the
+/// bus hands it to us before the owner can take it back (WirePlumber asks
+/// for it again as soon as it is free). An owner that agrees to release gets
+/// [`RELEASE_WAIT`] to hand the name over; WirePlumber closes its device
+/// first, and replacing it before then leaves the card's outputs muted. One
+/// that keeps the name past the wait is replaced, which is what owners like
+/// PulseAudio and JACK expect. That is tried [`MAX_TAKEOVER_ATTEMPTS`] times.
+fn negotiate(bus: &dyn Bus, name: &str, path: &str, now: &dyn Fn() -> Instant, sleep: &dyn Fn(Duration)) -> Outcome {
     match bus.request_name(name, false) {
         Ok(NameReply::PrimaryOwner) => return Outcome::Free,
-        Ok(NameReply::Exists) => {}
+        Ok(NameReply::InQueue) => {}
         Ok(NameReply::Other) => return Outcome::Failed(format!("unexpected reply asking for {name}")),
         Err(e) => return Outcome::Failed(e),
     }
@@ -90,9 +106,20 @@ fn negotiate(bus: &dyn Bus, name: &str, path: &str) -> Outcome {
             }
             Err(e) => return Outcome::Failed(e),
         }
+        let asked = now();
+        match wait_for_handover(bus, name, now, sleep) {
+            Ok(true) => {
+                let waited = now().saturating_duration_since(asked).as_millis();
+                log::info!("[reserve] reserved {name} on takeover attempt {attempt} (released by {owner} after {waited} ms)");
+                return Outcome::Released;
+            }
+            Ok(false) => {}
+            Err(e) => return Outcome::Failed(e),
+        }
+        log::info!("[reserve] {owner} didn't release {name} within {} ms; replacing it", RELEASE_WAIT.as_millis());
         match bus.request_name(name, true) {
             Ok(NameReply::PrimaryOwner) => {
-                log::info!("[reserve] reserved {name} from {owner} on takeover attempt {attempt}");
+                log::info!("[reserve] reserved {name} on takeover attempt {attempt} (replaced {owner})");
                 return Outcome::Released;
             }
             Ok(_) => log::info!("[reserve] takeover attempt {attempt} lost to {owner}; retrying"),
@@ -101,6 +128,20 @@ fn negotiate(bus: &dyn Bus, name: &str, path: &str) -> Outcome {
     }
     log::warn!("[reserve] gave up on {name} after {MAX_TAKEOVER_ATTEMPTS} takeover attempts");
     Outcome::Refused
+}
+
+/// Whether the bus handed `name` to us within [`RELEASE_WAIT`].
+fn wait_for_handover(bus: &dyn Bus, name: &str, now: &dyn Fn() -> Instant, sleep: &dyn Fn(Duration)) -> Result<bool, String> {
+    let deadline = now() + RELEASE_WAIT;
+    loop {
+        if bus.owns(name)? {
+            return Ok(true);
+        }
+        if now() >= deadline {
+            return Ok(false);
+        }
+        sleep(RELEASE_POLL);
+    }
 }
 
 /// The `org.freedesktop.ReserveDevice1` object other apps call while Zeke
@@ -149,36 +190,36 @@ impl ZbusBus<'_> {
         e.to_string()
     }
 
+    /// A method of the bus itself.
+    fn call_dbus<B>(&self, method: &str, body: &B) -> zbus::Result<zbus::message::Message>
+    where
+        B: serde::Serialize + zbus::zvariant::DynamicType,
+    {
+        self.conn.call_method(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", Some("org.freedesktop.DBus"), method, body)
+    }
+
     /// `ReleaseName` on the bus itself, bypassing zbus's list of names.
     fn release_directly(&self, name: &str) -> Result<(), String> {
-        self.conn
-            .call_method(
-                Some("org.freedesktop.DBus"),
-                "/org/freedesktop/DBus",
-                Some("org.freedesktop.DBus"),
-                "ReleaseName",
-                &(name,),
-            )
-            .map(drop)
-            .map_err(|e| self.err(e))
+        self.call_dbus("ReleaseName", &(name,)).map(drop).map_err(|e| self.err(e))
     }
 }
 
 impl Bus for ZbusBus<'_> {
     fn request_name(&self, name: &str, replace: bool) -> Result<NameReply, String> {
-        let mut flags = RequestNameFlags::DoNotQueue.into();
-        if replace {
-            flags |= RequestNameFlags::ReplaceExisting;
-        }
-        match self.conn.request_name_with_flags(name, flags) {
+        let flags: u32 = if replace { RequestNameFlags::ReplaceExisting as u32 } else { 0 };
+        // On the bus itself: zbus answers a name it saw queued from its own
+        // list, so a later ReplaceExisting would never reach the bus.
+        let reply = self
+            .call_dbus("RequestName", &(name, flags))
+            .and_then(|reply| reply.body().deserialize::<RequestNameReply>())
+            .map_err(|e| self.err(e))?;
+        Ok(match reply {
             // AlreadyOwner: the name is ours, e.g. after a timed-out request
             // the bus granted anyway.
-            Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => Ok(NameReply::PrimaryOwner),
-            Ok(_) => Ok(NameReply::Other),
-            // zbus reports a `DoNotQueue` "Exists" reply as NameTaken.
-            Err(zbus::Error::NameTaken) => Ok(NameReply::Exists),
-            Err(e) => Err(self.err(e)),
-        }
+            RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner => NameReply::PrimaryOwner,
+            RequestNameReply::InQueue => NameReply::InQueue,
+            RequestNameReply::Exists => NameReply::Other,
+        })
     }
 
     fn request_release(&self, name: &str, path: &str, priority: i32) -> Result<bool, String> {
@@ -201,6 +242,19 @@ impl Bus for ZbusBus<'_> {
                 }
                 self.release_directly(name)
             }
+        }
+    }
+
+    fn owns(&self, name: &str) -> Result<bool, String> {
+        match self.call_dbus("GetNameOwner", &(name,)) {
+            Ok(reply) => {
+                let owner: String = reply.body().deserialize().map_err(|e| self.err(e))?;
+                Ok(self.conn.unique_name().is_some_and(|me| me.as_str() == owner))
+            }
+            Err(zbus::Error::MethodError(error, _, _)) if error.as_str() == "org.freedesktop.DBus.Error.NameHasNoOwner" => {
+                Ok(false)
+            }
+            Err(e) => Err(self.err(e)),
         }
     }
 
@@ -299,7 +353,7 @@ impl CardReserver for DbusReserver {
             return Reservation::Failed(format!("serving {path}: {e}"));
         }
         let bus = ZbusBus { conn: &conn, broken: Cell::new(false) };
-        let outcome = negotiate(&bus, &name, &path);
+        let outcome = negotiate(&bus, &name, &path, &Instant::now, &std::thread::sleep);
         match outcome {
             Outcome::Free | Outcome::Released => {
                 let hold = Hold::new(Owned { conn: conn.clone(), name, path });
@@ -311,6 +365,8 @@ impl CardReserver for DbusReserver {
                 }
             }
             Outcome::Refused => {
+                // Out of the name's queue.
+                let _ = bus.release_name(&name);
                 unserve(&conn, &path);
                 Reservation::Refused
             }
@@ -381,12 +437,18 @@ mod tests {
     struct Scripted {
         names: RefCell<VecDeque<Result<NameReply, String>>>,
         releases: RefCell<VecDeque<Result<bool, String>>>,
+        owns: RefCell<VecDeque<Result<bool, String>>>,
         calls: RefCell<Vec<String>>,
     }
 
     impl Scripted {
         fn new(names: Vec<Result<NameReply, String>>, releases: Vec<Result<bool, String>>) -> Self {
             Scripted { names: RefCell::new(names.into()), releases: RefCell::new(releases.into()), ..Default::default() }
+        }
+        /// Whether the name is ours at each check, in order.
+        fn owns(self, owns: Vec<Result<bool, String>>) -> Self {
+            self.owns.replace(owns.into());
+            self
         }
         fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
@@ -406,65 +468,119 @@ mod tests {
             self.calls.borrow_mut().push("release_name".into());
             Ok(())
         }
+        fn owns(&self, _name: &str) -> Result<bool, String> {
+            self.calls.borrow_mut().push("owns".into());
+            self.owns.borrow_mut().pop_front().expect("scripted owns")
+        }
+    }
+
+    /// Time that passes only when slept.
+    struct Clock {
+        start: Instant,
+        elapsed: Cell<Duration>,
     }
 
     const NAME: &str = "org.freedesktop.ReserveDevice1.Audio1";
     const PATH: &str = "/org/freedesktop/ReserveDevice1/Audio1";
 
+    /// Checks at 0, RELEASE_POLL, … RELEASE_WAIT.
+    fn checks_in_the_wait() -> usize {
+        (RELEASE_WAIT.as_millis() / RELEASE_POLL.as_millis()) as usize + 1
+    }
+
+    fn run(bus: &Scripted) -> (Outcome, Duration) {
+        let clock = Clock { start: Instant::now(), elapsed: Cell::new(Duration::ZERO) };
+        let outcome = negotiate(bus, NAME, PATH, &|| clock.start + clock.elapsed.get(), &|d| {
+            clock.elapsed.set(clock.elapsed.get() + d)
+        });
+        (outcome, clock.elapsed.get())
+    }
+
+    fn requests(bus: &Scripted) -> Vec<String> {
+        bus.calls().into_iter().filter(|c| c.starts_with("request_")).collect()
+    }
+
     #[test]
     fn negotiate_free() {
         let bus = Scripted::new(vec![Ok(NameReply::PrimaryOwner)], vec![]);
-        assert_eq!(negotiate(&bus, NAME, PATH), Outcome::Free);
+        assert_eq!(run(&bus).0, Outcome::Free);
         assert_eq!(bus.calls(), ["request_name(false)"]);
     }
 
     #[test]
     fn negotiate_refused() {
-        let bus = Scripted::new(vec![Ok(NameReply::Exists)], vec![Ok(false)]);
-        assert_eq!(negotiate(&bus, NAME, PATH), Outcome::Refused);
+        let bus = Scripted::new(vec![Ok(NameReply::InQueue)], vec![Ok(false)]);
+        assert_eq!(run(&bus).0, Outcome::Refused);
         assert_eq!(bus.calls(), ["request_name(false)", "request_release(10)"]);
     }
 
     #[test]
     fn negotiate_released() {
-        let bus = Scripted::new(vec![Ok(NameReply::Exists), Ok(NameReply::PrimaryOwner)], vec![Ok(true)]);
-        assert_eq!(negotiate(&bus, NAME, PATH), Outcome::Released);
-        assert_eq!(bus.calls(), ["request_name(false)", "request_release(10)", "request_name(true)"]);
+        let bus = Scripted::new(vec![Ok(NameReply::InQueue)], vec![Ok(true)]).owns(vec![Ok(true)]);
+        assert_eq!(run(&bus), (Outcome::Released, Duration::ZERO));
+        assert_eq!(bus.calls(), ["request_name(false)", "request_release(10)", "owns"]);
+    }
+
+    #[test]
+    fn negotiate_waits_for_the_owner_to_release() {
+        let bus = Scripted::new(vec![Ok(NameReply::InQueue)], vec![Ok(true)]).owns(vec![Ok(false), Ok(false), Ok(true)]);
+        assert_eq!(run(&bus), (Outcome::Released, 2 * RELEASE_POLL));
+        assert_eq!(bus.calls(), ["request_name(false)", "request_release(10)", "owns", "owns", "owns"]);
+    }
+
+    #[test]
+    fn negotiate_replaces_an_owner_that_keeps_the_name() {
+        let bus = Scripted::new(vec![Ok(NameReply::InQueue), Ok(NameReply::PrimaryOwner)], vec![Ok(true)])
+            .owns(vec![Ok(false); checks_in_the_wait()]);
+        let (outcome, waited) = run(&bus);
+        assert_eq!(outcome, Outcome::Released);
+        assert!(waited >= RELEASE_WAIT && waited < RELEASE_WAIT + RELEASE_POLL, "{waited:?}");
+        assert_eq!(requests(&bus), ["request_name(false)", "request_release(10)", "request_name(true)"]);
     }
 
     #[test]
     fn negotiate_race_then_success() {
-        let bus = Scripted::new(
-            vec![Ok(NameReply::Exists), Ok(NameReply::Exists), Ok(NameReply::PrimaryOwner)],
-            vec![Ok(true), Ok(true)],
-        );
-        assert_eq!(negotiate(&bus, NAME, PATH), Outcome::Released);
+        // The owner keeps the name and can't be replaced; on the second
+        // attempt it hands it over.
+        let mut owns = vec![Ok(false); checks_in_the_wait()];
+        owns.push(Ok(true));
+        let bus = Scripted::new(vec![Ok(NameReply::InQueue), Ok(NameReply::InQueue)], vec![Ok(true), Ok(true)]).owns(owns);
+        assert_eq!(run(&bus).0, Outcome::Released);
         assert_eq!(
-            bus.calls(),
-            ["request_name(false)", "request_release(10)", "request_name(true)", "request_release(10)", "request_name(true)"]
+            requests(&bus),
+            ["request_name(false)", "request_release(10)", "request_name(true)", "request_release(10)"]
         );
     }
 
     #[test]
     fn negotiate_race_twice_refused() {
         let bus = Scripted::new(
-            vec![Ok(NameReply::Exists), Ok(NameReply::Exists), Ok(NameReply::Exists)],
+            vec![Ok(NameReply::InQueue), Ok(NameReply::InQueue), Ok(NameReply::InQueue)],
             vec![Ok(true), Ok(true), Ok(true)],
-        );
-        assert_eq!(negotiate(&bus, NAME, PATH), Outcome::Refused);
+        )
+        .owns(vec![Ok(false); 2 * checks_in_the_wait()]);
+        assert_eq!(run(&bus).0, Outcome::Refused);
         assert_eq!(bus.calls().iter().filter(|c| c.starts_with("request_release")).count(), 2);
     }
 
     #[test]
     fn negotiate_bus_error() {
         let bus = Scripted::new(vec![Err("disconnected".into())], vec![]);
-        assert_eq!(negotiate(&bus, NAME, PATH), Outcome::Failed("disconnected".into()));
+        assert_eq!(run(&bus).0, Outcome::Failed("disconnected".into()));
 
-        let bus = Scripted::new(vec![Ok(NameReply::Exists)], vec![Err("timeout".into())]);
-        assert_eq!(negotiate(&bus, NAME, PATH), Outcome::Failed("timeout".into()));
+        let bus = Scripted::new(vec![Ok(NameReply::InQueue)], vec![Err("timeout".into())]);
+        assert_eq!(run(&bus).0, Outcome::Failed("timeout".into()));
 
-        let bus = Scripted::new(vec![Ok(NameReply::Exists), Err("timeout".into())], vec![Ok(true)]);
-        assert_eq!(negotiate(&bus, NAME, PATH), Outcome::Failed("timeout".into()));
+        let bus = Scripted::new(vec![Ok(NameReply::InQueue), Err("timeout".into())], vec![Ok(true)])
+            .owns(vec![Ok(false); checks_in_the_wait()]);
+        assert_eq!(run(&bus).0, Outcome::Failed("timeout".into()));
+    }
+
+    #[test]
+    fn negotiate_bus_error_while_waiting() {
+        let bus = Scripted::new(vec![Ok(NameReply::InQueue)], vec![Ok(true)]).owns(vec![Ok(false), Err("timeout".into())]);
+        assert_eq!(run(&bus).0, Outcome::Failed("timeout".into()));
+        assert_eq!(bus.calls(), ["request_name(false)", "request_release(10)", "owns", "owns"]);
     }
 
     #[test]
