@@ -84,7 +84,7 @@ async fn store<T: Serialize>(state: &AppState, key: &str, value: &T, tier: Cache
 /// The signed-in user's id (favorites are per user).
 async fn user_id(state: &AppState) -> Result<u64, TidalError> {
     let client = client(state, "user id").await;
-    client.tokens.as_ref().and_then(|t| t.user_id).ok_or(TidalError::NotAuthenticated)
+    client.tokens().and_then(|t| t.user_id).ok_or(TidalError::NotAuthenticated)
 }
 
 pub async fn album_page(state: &Arc<AppState>, album_id: u64) -> Result<AlbumPageResponse, TidalError> {

@@ -7,7 +7,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
 
-use crate::tidal_api::AuthTokens;
+use crate::tidal_api::{AuthTokens, Stamp, DEFAULT_COUNTRY};
 use crate::AppState;
 use crate::AuthMethod;
 use crate::Settings;
@@ -53,11 +53,12 @@ pub async fn load_saved_auth(state: &AppState) -> Result<Option<AuthTokens>, Tid
         if let Some(ref tokens) = settings.auth_tokens {
             let (id, secret) = resolve_credentials(&settings);
             let mut client = state.tidal_client.lock().await;
-            client.tokens = Some(tokens.clone());
+            // Keep the saved stamp: an old token must not look fresh.
+            client.set_tokens(Some(tokens.clone()), Stamp::Keep);
             client.set_credentials(&id, &secret);
             // Fetch session info to populate country_code for search
             match client.get_session_info().await {
-                Ok(_) => log::debug!("[load_saved_auth]: tokens restored, country_code: {}", client.country_code),
+                Ok(_) => log::debug!("[load_saved_auth]: tokens restored, country_code: {}", client.country_code()),
                 Err(e) => log::debug!("[load_saved_auth]: tokens restored but session info failed (will use default country_code): {}", e.log_safe()),
             }
             return Ok(Some(tokens.clone()));
@@ -107,8 +108,8 @@ pub async fn logout(state: &AppState) -> Result<(), TidalError> {
     log::debug!("[logout]");
     {
         let mut client = state.tidal_client.lock().await;
-        client.tokens = None;
-        client.country_code = "US".to_string();
+        client.set_tokens(None, Stamp::Keep);
+        client.set_country_code(DEFAULT_COUNTRY);
     }
 
     // Cache first, so a failed settings write still leaves no cached data.

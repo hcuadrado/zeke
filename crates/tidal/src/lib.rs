@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod client_lock;
 pub mod commands;
+pub mod credential;
 pub mod crypto;
 pub mod embedded_config;
 mod error;
@@ -346,6 +347,7 @@ mod settings_tests {
             expires_in: 1,
             token_type: "Bearer".into(),
             user_id: Some(1),
+            obtained_at: 0,
         };
         persist_auth_tokens(&path, &crypto, &tokens);
         let raw = fs::read(&path).unwrap();
