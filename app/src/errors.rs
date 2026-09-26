@@ -38,17 +38,19 @@ pub fn player(kind: ErrorKind, message: &str) -> String {
         ErrorKind::LoginExpired => LOGIN_EXPIRED.into(),
         ErrorKind::Unplayable => "TIDAL can’t play these tracks right now. Playback stopped.".into(),
         ErrorKind::DeviceBusy => {
-            "The audio device is busy: another app is using it. Close that app, or turn off exclusive mode in Preferences."
+            "The audio device is busy: another app is using it. Close that app, or choose another output from the player bar’s output menu."
                 .into()
         }
         ErrorKind::UnsupportedRate => match rate_khz(message) {
             Some(khz) => format!(
-                "The audio device can’t play {khz} kHz bit-perfect. Turn off bit-perfect mode in Preferences."
+                "The audio device can’t play {khz} kHz bit-perfect. Turn off bit-perfect for this device in the player bar’s output menu."
             ),
-            None => "The audio device can’t play this track bit-perfect. Turn off bit-perfect mode in Preferences."
+            None => "The audio device can’t play this track bit-perfect. Turn off bit-perfect for this device in the player bar’s output menu."
                 .into(),
         },
-        ErrorKind::Device => "The audio device stopped working or changed. Check the output in Preferences.".into(),
+        ErrorKind::Device => {
+            "The audio device stopped working or changed. Choose an output from the player bar’s output menu.".into()
+        }
         ErrorKind::Other => "Couldn’t play this track. The details are in the log.".into(),
     }
 }
@@ -124,7 +126,7 @@ mod tests {
         let rate = zeke_player::unsupported_rate_error(96000);
         assert_eq!(
             player(ErrorKind::UnsupportedRate, &rate),
-            "The audio device can’t play 96 kHz bit-perfect. Turn off bit-perfect mode in Preferences."
+            "The audio device can’t play 96 kHz bit-perfect. Turn off bit-perfect for this device in the player bar’s output menu."
         );
         assert!(player(ErrorKind::UnsupportedRate, "odd").contains("this track"));
         assert!(player(ErrorKind::DeviceBusy, "device_busy: Device or resource busy").starts_with("The audio device is busy"));
@@ -132,6 +134,21 @@ mod tests {
         assert!(!other.contains("https"));
         assert_eq!(rate_khz("DAC doesn't support 192kHz — x"), Some("192"));
         assert_eq!(rate_khz("no rate"), None);
+    }
+
+    #[test]
+    fn no_player_message_mentions_preferences() {
+        let rate = zeke_player::unsupported_rate_error(96000);
+        for (kind, message) in [
+            (ErrorKind::DeviceBusy, "device_busy"),
+            (ErrorKind::UnsupportedRate, rate.as_str()),
+            (ErrorKind::UnsupportedRate, "odd"),
+            (ErrorKind::Device, "device_disconnected"),
+        ] {
+            let text = player(kind, message);
+            assert!(!text.to_lowercase().contains("preferences"), "{text}");
+            assert!(text.contains("output menu"), "{text}");
+        }
     }
 
     #[test]
