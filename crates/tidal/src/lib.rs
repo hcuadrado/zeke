@@ -18,6 +18,7 @@ pub mod util;
 pub use error::TidalError;
 
 use cache::DiskCache;
+use credential::{BoxFuture, Credential, CredentialSource, Refresh};
 use crypto::Crypto;
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -201,6 +202,11 @@ pub struct AppState {
     pub cache_dir: PathBuf,
     pub disk_cache: DiskCache,
     pub crypto: Arc<Crypto>,
+    /// Taken from the client before it went behind the lock, so a source
+    /// can be made without waiting for a request in flight.
+    credential_watch: tokio::sync::watch::Receiver<Option<Credential>>,
+    /// Shared by every `CredentialSource`: one refresh at a time.
+    refresh_flight: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -227,6 +233,7 @@ impl AppState {
             })
         });
 
+        let credential_watch = tidal_client.credential_watch();
         Ok(Self {
             tidal_client: Mutex::new(tidal_client),
             proxied_http,
@@ -234,7 +241,14 @@ impl AppState {
             cache_dir,
             disk_cache,
             crypto,
+            credential_watch,
+            refresh_flight: Arc::default(),
         })
+    }
+
+    /// The session's credential, for code that needs the access token.
+    pub fn credential_source(self: &Arc<Self>) -> CredentialSource {
+        CredentialSource::new(self.credential_watch.clone(), self.clone(), Arc::clone(&self.refresh_flight))
     }
 
     pub fn load_settings(&self) -> Option<Settings> {
@@ -270,6 +284,19 @@ impl AppState {
         let encrypted = self.crypto.encrypt(json.as_bytes())?;
         write_atomic(&self.settings_path, &encrypted)?;
         Ok(())
+    }
+}
+
+impl Refresh for AppState {
+    fn refresh<'a>(&'a self, stale: &'a str) -> BoxFuture<'a, Result<(), TidalError>> {
+        Box::pin(async move {
+            let mut client = self.tidal_client.lock().await;
+            // A refresh after a 401 may have beaten us to it.
+            if client.tokens().map(|t| t.access_token.as_str()) != Some(stale) {
+                return Ok(());
+            }
+            client.refresh_token().await.map(drop)
+        })
     }
 }
 
