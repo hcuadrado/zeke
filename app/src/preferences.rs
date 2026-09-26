@@ -102,15 +102,15 @@ impl ZekePreferences {
         imp.quality_row.set_model(Some(&qualities));
         let at = QUALITIES.iter().position(|(q, _)| *q == s.max_quality).unwrap_or(0);
         imp.quality_row.set_selected(at as u32);
-        imp.exclusive_row.set_active(s.exclusive_mode);
-        imp.bit_perfect_row.set_active(s.bit_perfect);
+        imp.exclusive_row.set_active(s.output_device.is_some());
+        imp.bit_perfect_row.set_active(s.output_device.as_deref().is_some_and(|d| s.bit_perfect_on(d)));
         imp.gapless_row.set_active(s.gapless);
         imp.normalization_row.set_active(s.volume_normalization);
         let at = SCHEMES.iter().position(|(c, _)| *c == s.color_scheme).unwrap_or(0);
         imp.color_scheme_row.set_selected(at as u32);
         // Until the device list arrives, show the saved one alone.
-        let saved = s.exclusive_device.clone().map(|id| AudioDevice { name: id.clone(), id });
-        self.set_devices(saved.into_iter().collect(), s.exclusive_device.as_deref());
+        let saved = s.output_device.clone().map(|id| AudioDevice { name: id.clone(), id });
+        self.set_devices(saved.into_iter().collect(), s.output_device.as_deref());
         self.load_devices();
 
         imp.quality_row.connect_selected_notify(glib::clone!(
@@ -204,9 +204,10 @@ impl ZekePreferences {
         }
         let exclusive = imp.exclusive_row.is_active();
         let bit_perfect = imp.bit_perfect_row.is_active();
-        let device = self.selected_device().or_else(|| self.session().settings().exclusive_device);
+        let device = self.selected_device().or_else(|| self.session().settings().output_device);
         let s = self.session().settings();
-        if (s.exclusive_mode, s.bit_perfect, s.exclusive_device.as_deref()) == (exclusive, bit_perfect, device.as_deref()) {
+        let saved_bit_perfect = s.output_device.as_deref().is_some_and(|d| s.bit_perfect_on(d));
+        if (s.output_device.is_some(), saved_bit_perfect, s.output_device.as_deref()) == (exclusive, bit_perfect, device.as_deref()) {
             return;
         }
         self.session().set_output(exclusive, device, bit_perfect);

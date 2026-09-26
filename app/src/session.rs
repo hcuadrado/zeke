@@ -258,15 +258,17 @@ impl Session {
     }
 
     /// `device: None` keeps the saved device (e.g. before the list loaded).
+    /// Normal output saves no device.
     pub fn set_output(&self, exclusive: bool, device: Option<String>, bit_perfect: bool) {
-        let device = device.or_else(|| self.settings.borrow().exclusive_device.clone());
+        let device = device.or_else(|| self.settings.borrow().output_device.clone());
         self.send(PlayerCommand::SetOutput { exclusive, device: device.clone(), bit_perfect });
         self.change_settings(move |s| {
-            s.exclusive_mode = exclusive;
-            if device.is_some() {
-                s.exclusive_device = device.clone();
+            s.output_device = device.clone().filter(|_| exclusive);
+            if let Some(device) = &device
+                && exclusive
+            {
+                s.set_bit_perfect_on(device, bit_perfect);
             }
-            s.bit_perfect = bit_perfect;
         });
     }
 
@@ -282,7 +284,7 @@ impl Session {
 
     /// Record the device picked at startup (already applied to the player).
     pub fn device_chosen(&self, device: String) {
-        self.settings.borrow_mut().exclusive_device = Some(device);
+        self.settings.borrow_mut().output_device = Some(device);
     }
 }
 
@@ -338,6 +340,7 @@ async fn run(
     let probe = Arc::new(PipelineProbe::new(Arc::clone(&signal_path), Arc::clone(&engine)));
 
     let queue_file = state.settings_path.parent().map(PersistedQueue::path);
+    let bit_perfect = settings.output_device.as_deref().is_some_and(|d| settings.bit_perfect_on(d));
     let player = Player::spawn(
         Arc::clone(&state),
         engine,
@@ -347,7 +350,7 @@ async fn run(
                 gapless: settings.gapless,
                 normalization: settings.volume_normalization,
                 max_quality: settings.max_quality.clone(),
-                bit_perfect: settings.exclusive_mode && settings.bit_perfect,
+                bit_perfect,
                 ..Config::default()
             },
             seed: None,
@@ -355,8 +358,8 @@ async fn run(
         },
     );
 
-    let device = match settings.exclusive_device.clone().filter(|d| !d.is_empty()) {
-        None => pick_device(&state, &ui).await,
+    let device = match settings.output_device.clone().filter(|d| !d.is_empty()) {
+        None => pick_device().await,
         // Names saved by early builds (`hw:0,0`) move to the stable form.
         Some(saved) => match devices::stable_name(&saved).filter(|stable| *stable != saved) {
             Some(stable) => {
@@ -368,7 +371,7 @@ async fn run(
         },
     };
     for command in [
-        PlayerCommand::SetOutput { exclusive: settings.exclusive_mode, device, bit_perfect: settings.bit_perfect },
+        PlayerCommand::SetOutput { exclusive: settings.output_device.is_some(), device, bit_perfect },
         PlayerCommand::SetGapless(settings.gapless),
         PlayerCommand::SetVolume(settings.volume),
     ] {
@@ -417,8 +420,9 @@ async fn load_queue(path: std::path::PathBuf) -> Option<PersistedQueue> {
     }
 }
 
-/// Pick the first analog device, save it, and tell the UI.
-async fn pick_device(state: &Arc<AppState>, ui: &async_channel::Sender<UiEvent>) -> Option<String> {
+/// Pick the first analog device for the player. It isn't saved: a saved
+/// device means exclusive output.
+async fn pick_device() -> Option<String> {
     let picked = tokio::task::spawn_blocking(|| {
         let list = audio::list_alsa_devices().inspect_err(|e| log::warn!("[app] listing devices: {e}")).ok()?;
         devices::pick_default_device(&list)
@@ -431,7 +435,6 @@ async fn pick_device(state: &Arc<AppState>, ui: &async_channel::Sender<UiEvent>)
         return None;
     };
     log::info!("[app] exclusive device not set; picked {device}");
-    save_device(state, ui, device.clone()).await;
     Some(device)
 }
 
@@ -439,7 +442,7 @@ async fn pick_device(state: &Arc<AppState>, ui: &async_channel::Sender<UiEvent>)
 /// Runs before the UI can change the output (it has no device list yet).
 async fn save_device(state: &Arc<AppState>, ui: &async_channel::Sender<UiEvent>, device: String) {
     let (state, saved) = (Arc::clone(state), device.clone());
-    let result = tokio::task::spawn_blocking(move || state.update_settings(|s| s.exclusive_device = Some(saved))).await;
+    let result = tokio::task::spawn_blocking(move || state.update_settings(|s| s.output_device = Some(saved))).await;
     if let Ok(Err(e)) = result {
         log::error!("[app] saving the exclusive device failed: {}", e.log_safe());
     }
