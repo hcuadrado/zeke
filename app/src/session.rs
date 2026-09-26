@@ -126,6 +126,8 @@ pub enum UiEvent {
     OutputFellBack(Option<String>),
     /// The output the playing track opened; `None` is the system default.
     OutputActive(Option<String>),
+    /// The output devices, listed at startup.
+    OutputsListed(Vec<AudioDevice>),
     /// From MPRIS: bring the window up, quit, set the volume.
     Raise,
     Quit,
@@ -445,6 +447,20 @@ async fn run(
             None
         }
     };
+    // List the devices once before the first track can take a card: while
+    // Zeke holds a card exclusively, PipeWire no longer lists its devices.
+    tokio::spawn({
+        let ui = ui.clone();
+        async move {
+            match tokio::task::spawn_blocking(list_devices).await {
+                Ok(Ok(list)) => {
+                    let _ = ui.send(UiEvent::OutputsListed(list)).await;
+                }
+                Ok(Err(e)) => log::warn!("[app] listing devices: {e}"),
+                Err(e) => log::warn!("[app] listing devices: {e}"),
+            }
+        }
+    });
     for command in [
         output_command(&settings, device),
         PlayerCommand::SetGapless(settings.gapless),

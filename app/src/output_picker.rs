@@ -7,6 +7,7 @@ use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::glib;
 use zeke_engine::audio::AudioDevice;
+use zeke_engine::devices;
 
 use crate::runtime;
 use crate::session::list_devices;
@@ -84,14 +85,25 @@ impl ZekeWindow {
             let Some(window) = window.upgrade() else { return };
             window.imp().listing_outputs.set(false);
             match result {
-                Ok(Ok(list)) => {
-                    window.imp().output_devices.replace(list);
-                    window.refresh_outputs();
-                }
+                Ok(Ok(list)) => window.outputs_listed(list),
                 Ok(Err(e)) => log::warn!("[app] listing devices: {e}"),
                 Err(e) => log::warn!("[app] listing devices: {e}"),
             }
         });
+    }
+
+    /// Take a new device list. The devices of the card Zeke plays on
+    /// exclusively are kept from the last list: PipeWire stops listing
+    /// them while Zeke holds the card.
+    pub fn outputs_listed(&self, list: Vec<AudioDevice>) {
+        let imp = self.imp();
+        let held = match &*imp.active_output.borrow() {
+            Some(Some(device)) => devices::card_index(device),
+            _ => None,
+        };
+        let merged = merge_outputs(&imp.output_devices.borrow(), list, held, devices::card_index);
+        imp.output_devices.replace(merged);
+        self.refresh_outputs();
     }
 
     fn render_outputs(&self) {
@@ -166,6 +178,30 @@ impl ZekeWindow {
     }
 }
 
+/// `fresh`, keeping the entries of `previous` on the `held` card that it
+/// lacks, in their old place. Any other device missing from `fresh` is gone.
+/// `card_of` is the card index of a device name.
+fn merge_outputs(
+    previous: &[AudioDevice],
+    fresh: Vec<AudioDevice>,
+    held: Option<u32>,
+    card_of: impl Fn(&str) -> Option<u32>,
+) -> Vec<AudioDevice> {
+    let mut out: Vec<AudioDevice> = previous
+        .iter()
+        .filter_map(|old| match fresh.iter().find(|d| d.id == old.id) {
+            Some(new) => Some(new.clone()),
+            None => (held.is_some() && card_of(&old.id) == held).then(|| old.clone()),
+        })
+        .collect();
+    for new in fresh {
+        if !out.iter().any(|d| d.id == new.id) {
+            out.push(new);
+        }
+    }
+    out
+}
+
 /// Labels that tell devices apart: the words all names share (the card,
 /// e.g. "Meteor Lake-P HD Audio Controller") are dropped, and the card and
 /// device number follow: "Speaker (sofhdadsp, device 0)".
@@ -198,6 +234,62 @@ mod tests {
 
     fn dev(id: &str, name: &str) -> AudioDevice {
         AudioDevice { id: id.into(), name: name.into() }
+    }
+
+    fn ids(list: &[AudioDevice]) -> Vec<&str> {
+        list.iter().map(|d| d.id.as_str()).collect()
+    }
+
+    /// Card 0 is `sofhdadsp`, card 1 `DAC`.
+    fn card_of(id: &str) -> Option<u32> {
+        if id.contains("sofhdadsp") {
+            Some(0)
+        } else if id.contains("DAC") {
+            Some(1)
+        } else {
+            None
+        }
+    }
+
+    fn before() -> Vec<AudioDevice> {
+        vec![
+            dev("hw:CARD=sofhdadsp,DEV=0", "HDA Speaker"),
+            dev("hw:CARD=sofhdadsp,DEV=3", "HDA HDMI 1"),
+            dev("hw:CARD=DAC,DEV=0", "USB DAC"),
+        ]
+    }
+
+    #[test]
+    fn a_new_list_keeps_the_held_cards_devices() {
+        // Zeke holds card 0: PipeWire lists only the DAC.
+        let merged = merge_outputs(&before(), vec![dev("hw:CARD=DAC,DEV=0", "USB DAC")], Some(0), card_of);
+        assert_eq!(ids(&merged), ["hw:CARD=sofhdadsp,DEV=0", "hw:CARD=sofhdadsp,DEV=3", "hw:CARD=DAC,DEV=0"]);
+        assert_eq!(device_labels(&merged), device_labels(&before()), "labels unchanged");
+    }
+
+    #[test]
+    fn a_new_list_drops_a_missing_device_on_another_card() {
+        let fresh = vec![dev("hw:CARD=sofhdadsp,DEV=3", "HDA HDMI 1")];
+        // Card 0 held: its speaker stays, the unplugged DAC goes.
+        let merged = merge_outputs(&before(), fresh.clone(), Some(0), card_of);
+        assert_eq!(ids(&merged), ["hw:CARD=sofhdadsp,DEV=0", "hw:CARD=sofhdadsp,DEV=3"]);
+        // Nothing held: only what is listed.
+        assert_eq!(ids(&merge_outputs(&before(), fresh, None, card_of)), ["hw:CARD=sofhdadsp,DEV=3"]);
+    }
+
+    #[test]
+    fn a_new_list_takes_the_fresh_entry_and_adds_new_devices() {
+        let fresh = vec![
+            dev("hw:CARD=sofhdadsp,DEV=0", "HDA Headphones"),
+            dev("hw:CARD=DAC,DEV=0", "USB DAC"),
+            dev("hw:CARD=DAC,DEV=1", "USB DAC Digital"),
+        ];
+        let merged = merge_outputs(&before(), fresh, Some(0), card_of);
+        assert_eq!(merged[0].name, "HDA Headphones");
+        assert_eq!(
+            ids(&merged),
+            ["hw:CARD=sofhdadsp,DEV=0", "hw:CARD=sofhdadsp,DEV=3", "hw:CARD=DAC,DEV=0", "hw:CARD=DAC,DEV=1"]
+        );
     }
 
     #[test]

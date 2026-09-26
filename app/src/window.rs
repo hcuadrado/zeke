@@ -385,6 +385,7 @@ impl ZekeWindow {
                 self.toast(&crate::errors::fell_back(device.map(|d| self.output_label(Some(&d))).as_deref()));
                 self.refresh_outputs();
             }
+            UiEvent::OutputsListed(list) => self.outputs_listed(list),
             UiEvent::OutputActive(device) => {
                 imp.active_output.replace(Some(device));
                 self.refresh_outputs();
