@@ -1,7 +1,5 @@
-<h1 align="center">Zeke</h1>
-
 <p align="center">
-  <img src="data/icons/128/io.github.hcuadrado.Zeke.png" alt="Zeke icon" width="128" height="128">
+  <img src="data/icons/256/io.github.hcuadrado.Zeke.png" alt="Zeke icon" width="256" height="256">
 </p>
 
 A native Linux TIDAL player for hi-res lossless playback (up to 24-bit/192 kHz,
@@ -46,12 +44,14 @@ MVP: the core player is complete. What it does today:
 | `crates/cli` | headless test tool |
 | `app` | GTK4 + libadwaita application |
 
-## Building (openSUSE)
+## Building (openSUSE Tumbleweed/Slowroll)
 
 ```sh
 sudo zypper in gtk4-devel libadwaita-devel gstreamer-devel gstreamer-plugins-base-devel \
   gstreamer-plugins-good gstreamer-plugins-bad gstreamer-utils alsa-devel blueprint-compiler \
-  webkitgtk4-devel libsoup-devel
+  webkitgtk4-devel libsoup-devel rustup
+rustup default stable
+rustup component add rust-analyzer rust-src # Optional but recommended
 cargo run -p zeke
 ```
 
