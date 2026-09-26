@@ -413,6 +413,9 @@ struct WriterSlot {
     /// than reuse a stale-mode writer.
     bit_perfect: Option<bool>,
     lease: Option<Lease>,
+    /// Set before Shutdown is sent, for a writer that isn't reading its
+    /// channel: one spinning in its pause loop.
+    stop: Arc<AtomicBool>,
 }
 
 impl WriterSlot {
@@ -422,6 +425,9 @@ impl WriterSlot {
 
     /// Ask the writer to stop, without waiting for it.
     fn request_shutdown(&mut self) {
+        // A resume queued behind Stop can pause the writer again after Stop
+        // cleared `paused`; the flag gets it out of its pause loop.
+        self.stop.store(true, Ordering::Release);
         if let Some(tx) = self.tx.take() {
             // Blocking, not a timeout: the writer may be draining the DAC
             // after a gapless boundary with a full channel, and a lost
@@ -1471,6 +1477,8 @@ fn spawn_alsa_writer(
     current_sample_rate: Arc<AtomicU32>,
     writer_gen: Arc<AtomicU64>,
     paused: Arc<AtomicBool>,
+    // Zeke: the slot's stop flag, which ends a pause.
+    stop: Arc<AtomicBool>,
     bit_perfect: bool,
     combined_vol: Arc<AtomicU32>,
     // Zeke: the user volume as an amplitude, so a gapless TrackBoundary can
@@ -1781,6 +1789,12 @@ fn spawn_alsa_writer(
                             if can_hw { pcm.pause(true).ok(); }
 
                             while paused.load(Ordering::Acquire) {
+                                if stop.load(Ordering::Acquire) {
+                                    // Shutdown is queued; see `WriterSlot::stop`.
+                                    log::debug!("[alsa-writer] shutdown while paused");
+                                    pcm.drop().ok();
+                                    break 'main;
+                                }
                                 if can_hw {
                                     // HW pause: DAC frozen, nothing to feed — just sleep
                                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -2601,6 +2615,7 @@ impl AudioPlayer {
                                         );
                                         writer.shutdown();
                                         drop(stale);
+                                        let stop = Arc::new(AtomicBool::new(false));
                                         let (tx, handle, negotiated_fmt, supported_gst_fmts, supported_rates, lease) = spawn_alsa_writer(
                                             dev,
                                             &default_fmt,
@@ -2610,6 +2625,7 @@ impl AudioPlayer {
                                             Arc::clone(&current_sample_rate),
                                             Arc::clone(&writer_gen),
                                             Arc::clone(&paused),
+                                            Arc::clone(&stop),
                                             bit_perfect,
                                             Arc::clone(&combined_vol),
                                             Arc::clone(&user_amp),
@@ -2629,6 +2645,7 @@ impl AudioPlayer {
                                             device: Some(dev.to_string()),
                                             bit_perfect: Some(bit_perfect),
                                             lease: Some(lease),
+                                            stop,
                                         };
                                     }
 
@@ -4910,5 +4927,59 @@ mod writer_slot_tests {
         assert!(got_shutdown.try_recv().is_ok());
         assert!(released.load(Ordering::SeqCst));
         assert!(writer.tx.is_none() && writer.thread.is_none() && writer.lease.is_none());
+    }
+
+    /// A paused writer is stopped even though it never reads Shutdown from
+    /// its channel. Runs a real writer on ALSA's `null` device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_paused_writer_is_stopped() {
+        let (events, _rx) = crate::events::channel();
+        let format = PcmFormat {
+            sample_rate: 48000,
+            channels: 2,
+            gst_format: "S16LE".into(),
+            bytes_per_sample: 2,
+        };
+        let paused = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, thread, _, _, _, lease) = spawn_alsa_writer(
+            "null",
+            &format,
+            events.clone(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU32::new(48000)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::clone(&paused),
+            Arc::clone(&stop),
+            false,
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(SignalPathTracker::new(events)),
+            Arc::new(Mutex::new(None)),
+            Arc::new(Mutex::new(None)),
+            None,
+        )
+        .expect("the null device opens");
+        // A resume deferred past Stop leaves the writer paused: the chunk
+        // queued ahead of Shutdown puts it in its pause loop.
+        paused.store(true, Ordering::Release);
+        tx.send(WriterCommand::Data(AudioChunk { data: vec![0; 4 * 480], format, generation: 0 })).unwrap();
+        let mut writer = WriterSlot::default();
+        writer.tx = Some(tx);
+        writer.thread = Some(thread);
+        writer.lease = Some(lease);
+        writer.stop = stop;
+
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        std::thread::spawn(move || {
+            writer.shutdown();
+            done_tx.send(writer.thread.is_none()).ok();
+        });
+        let joined = done_rx.recv_timeout(Duration::from_secs(5)).expect("shutdown returns while paused");
+        assert!(joined);
     }
 }
