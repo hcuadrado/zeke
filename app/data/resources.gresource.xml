@@ -7,5 +7,6 @@
     <file>style.css</file>
     <file preprocess="xml-stripblanks">icons/scalable/actions/heart-filled-symbolic.svg</file>
     <file preprocess="xml-stripblanks">icons/scalable/actions/heart-outline-symbolic.svg</file>
+    <file preprocess="xml-stripblanks">icons/scalable/actions/speaker-symbolic.svg</file>
   </gresource>
 </gresources>
