@@ -72,6 +72,8 @@ Default.
 | `crates/engine` | GStreamer/ALSA audio engine |
 | `crates/player` | queue and playback state |
 | `crates/cli` | headless test tool |
+| `crates/plugins/api` | what a plugin is, and what the app gives it |
+| `crates/plugins/cast` | the Cast plugin (feature `cast`; empty for now) |
 | `app` | GTK4 + libadwaita application |
 
 ## Building (openSUSE Tumbleweed/Slowroll)
@@ -84,6 +86,10 @@ rustup default stable
 rustup component add rust-analyzer rust-src # Optional but recommended
 cargo run -p zeke
 ```
+
+`make check` runs clippy on every feature combination, the tests, and a
+check that a build without plugins pulls none in. It needs `cargo-hack`
+(`cargo install cargo-hack --locked`).
 
 ## Installing (current user)
 
