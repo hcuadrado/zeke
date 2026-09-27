@@ -156,16 +156,18 @@ impl ZekeWindow {
         let imp = self.imp();
         imp.repeat.set(repeat);
         let (icon, tip) = match repeat {
-            RepeatMode::Off => ("media-playlist-consecutive-symbolic", "Repeat: off"),
+            RepeatMode::Off => ("media-playlist-repeat-symbolic", "Repeat: off"),
             RepeatMode::All => ("media-playlist-repeat-symbolic", "Repeat: all"),
             RepeatMode::One => ("media-playlist-repeat-song-symbolic", "Repeat: one"),
         };
-        imp.sheet_repeat.set_icon_name(icon);
-        imp.sheet_repeat.set_tooltip_text(Some(tip));
-        if repeat == RepeatMode::Off {
-            imp.sheet_repeat.remove_css_class("accent");
-        } else {
-            imp.sheet_repeat.add_css_class("accent");
+        for button in [&*imp.bar_repeat, &*imp.sheet_repeat] {
+            button.set_icon_name(icon);
+            button.set_tooltip_text(Some(tip));
+            if repeat == RepeatMode::Off {
+                button.remove_css_class("accent");
+            } else {
+                button.add_css_class("accent");
+            }
         }
     }
 

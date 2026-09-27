@@ -724,6 +724,17 @@ template $ZekeWindow: Adw.ApplicationWindow {
                 spacing: 6;
                 halign: center;
 
+                ToggleButton {
+                  icon-name: "media-playlist-shuffle-symbolic";
+                  tooltip-text: "Shuffle";
+                  action-name: "win.shuffle";
+
+                  styles [
+                    "flat",
+                    "circular",
+                  ]
+                }
+
                 Button {
                   icon-name: "media-skip-backward-symbolic";
                   tooltip-text: "Previous";
@@ -749,6 +760,17 @@ template $ZekeWindow: Adw.ApplicationWindow {
                   icon-name: "media-skip-forward-symbolic";
                   tooltip-text: "Next";
                   action-name: "win.next";
+
+                  styles [
+                    "flat",
+                    "circular",
+                  ]
+                }
+
+                Button bar_repeat {
+                  icon-name: "media-playlist-repeat-symbolic";
+                  tooltip-text: "Repeat: off";
+                  action-name: "win.cycle-repeat";
 
                   styles [
                     "flat",
