@@ -99,6 +99,8 @@ mod imp {
         #[template_child]
         pub bar_play: TemplateChild<gtk::Button>,
         #[template_child]
+        pub bar_repeat: TemplateChild<gtk::Button>,
+        #[template_child]
         pub bar_badge: TemplateChild<gtk::MenuButton>,
         #[template_child]
         pub bar_track_labels: TemplateChild<gtk::Box>,
