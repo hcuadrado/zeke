@@ -8,12 +8,29 @@ DATADIR := $(PREFIX)/share
 DESKTOP := target/$(APP_ID).desktop
 ICON_SIZES := 32 48 64 128 256 512
 
-.PHONY: all build desktop install uninstall validate
+.PHONY: all build check desktop install uninstall validate
 
 all: build
 
 build:
 	cargo build --release -p zeke
+
+# Run before each merge; there is no CI. Every crate with no features,
+# each feature alone and the defaults (cargo-hack: `cargo install
+# cargo-hack --locked`), then the tests with everything on and the app's
+# tests without plugins. Last, the
+# build without plugins must not pull any plugin in; the same check on a
+# build with Cast shows it can see one.
+check:
+	cargo hack --workspace --each-feature clippy --all-targets -- -D warnings
+	cargo test --workspace --all-features
+	cargo test -p zeke --no-default-features --features webview
+	@if cargo tree -p zeke -e normal --no-default-features --features webview | grep -q zeke-plugin-cast; then \
+		echo "check: the build without plugins depends on zeke-plugin-cast"; exit 1; \
+	fi
+	@cargo tree -p zeke -e normal --features cast | grep -q zeke-plugin-cast || \
+		{ echo "check: cargo tree doesn't show zeke-plugin-cast even with --features cast"; exit 1; }
+	@echo "check: no plugin in the build without plugins"
 
 # The desktop entry names the installed binary by its full path: a desktop
 # session's PATH may not include ~/.local/bin. Written on every run, so it

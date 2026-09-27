@@ -56,6 +56,8 @@ const TIDAL_API_URL: &str = "https://api.tidal.com/v1";
 const TIDAL_API_V2_URL: &str = "https://api.tidal.com/v2";
 const TIDAL_OPENAPI_URL: &str = "https://openapi.tidal.com/v2";
 const TIDAL_CLIENT_VERSION: &str = "2026.9.15";
+/// The country the client asks for until the session tells it the user's.
+pub const DEFAULT_COUNTRY: &str = "US";
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct AuthTokens {
@@ -65,6 +67,37 @@ pub struct AuthTokens {
     pub token_type: String,
     #[serde(default)]
     pub user_id: Option<u64>,
+    /// When the access token was issued, in unix seconds; with `expires_in`
+    /// it tells when the token dies. Set by `TidalClient::set_tokens`. Zero
+    /// in token files saved before it existed, which makes them look expired
+    /// once, so the first caller that asks for a fresh token refreshes them.
+    #[serde(default)]
+    pub obtained_at: u64,
+}
+
+impl AuthTokens {
+    /// When the access token expires, in unix seconds.
+    pub fn expires_at(&self) -> u64 {
+        self.obtained_at.saturating_add(self.expires_in)
+    }
+}
+
+/// Seconds since the unix epoch, from the wall clock: token lifetimes are
+/// wall-clock times, and must survive a restart and a suspend.
+pub fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// How `TidalClient::set_tokens` treats `obtained_at`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stamp {
+    /// Tokens TIDAL just issued (login, refresh): stamp them with the time.
+    Now,
+    /// Tokens from before (the saved session): keep their stamp, so an old
+    /// token doesn't look fresh.
+    Keep,
 }
 
 // Hand-written so a stray `{:?}` never prints a token.
@@ -76,6 +109,7 @@ impl std::fmt::Debug for AuthTokens {
             .field("expires_in", &self.expires_in)
             .field("token_type", &self.token_type)
             .field("user_id", &self.user_id)
+            .field("obtained_at", &self.obtained_at)
             .finish()
     }
 }
@@ -1281,13 +1315,17 @@ pub struct TidalClient {
     /// The shared cell, not a client: when the proxy plan is blocked there is
     /// nothing to hand out, and that must stay unrepresentable here.
     http: crate::proxy_http::ProxiedHttp,
-    pub tokens: Option<AuthTokens>,
+    /// Written only by `set_tokens`, which also tells the credential watch.
+    tokens: Option<AuthTokens>,
     pub client_id: String,
     pub client_secret: String,
     /// The user's country code from their Tidal session (e.g. "US", "GB", "DE").
-    /// Populated after authentication via get_session_info().
-    pub country_code: String,
+    /// Populated after authentication via get_session_info(). Written only
+    /// by `set_country_code`, which also tells the credential watch.
+    country_code: String,
     token_persist: Option<TokenPersist>,
+    /// The session as the credential watch last saw it (`credential.rs`).
+    credential: tokio::sync::watch::Sender<Option<crate::credential::Credential>>,
     gate: Arc<crate::rate_gate::RateGate>,
 }
 
@@ -1298,10 +1336,64 @@ impl TidalClient {
             tokens: None,
             client_id: String::new(),
             client_secret: String::new(),
-            country_code: "US".to_string(),
+            country_code: DEFAULT_COUNTRY.to_string(),
             token_persist: None,
+            credential: tokio::sync::watch::Sender::new(None),
             gate: Arc::new(crate::rate_gate::RateGate::new()),
         }
+    }
+
+    pub fn tokens(&self) -> Option<&AuthTokens> {
+        self.tokens.as_ref()
+    }
+
+    /// The one way the client's tokens change: login, refresh, restoring the
+    /// saved session and logout all come through here, so the credential
+    /// watch sees every change. The stamp is set before anything clones the
+    /// tokens to save or return them. Returns the tokens as stored.
+    pub fn set_tokens(&mut self, tokens: Option<AuthTokens>, stamp: Stamp) -> Option<&AuthTokens> {
+        self.tokens = tokens.map(|mut t| {
+            if stamp == Stamp::Now {
+                t.obtained_at = unix_now();
+            }
+            t
+        });
+        self.publish_credential();
+        self.tokens.as_ref()
+    }
+
+    pub fn country_code(&self) -> &str {
+        &self.country_code
+    }
+
+    pub fn set_country_code(&mut self, country_code: &str) {
+        self.country_code = country_code.to_string();
+        self.publish_credential();
+    }
+
+    /// A receiver that sees the session's credential whenever it changes;
+    /// `None` while signed out.
+    pub fn credential_watch(&self) -> tokio::sync::watch::Receiver<Option<crate::credential::Credential>> {
+        self.credential.subscribe()
+    }
+
+    /// Tell the watch, built from the tokens and the country under the
+    /// client's lock, so a reader never sees one without the other. Quiet
+    /// when nothing it carries changed.
+    fn publish_credential(&self) {
+        let now = self.tokens.as_ref().map(|t| crate::credential::Credential {
+            access_token: t.access_token.clone(),
+            country_code: self.country_code.clone(),
+            user_id: t.user_id,
+            expires_at: t.expires_at(),
+        });
+        self.credential.send_if_modified(|seen| {
+            if *seen == now {
+                return false;
+            }
+            *seen = now;
+            true
+        });
     }
 
     /// Register the hook that writes refreshed tokens to disk.
@@ -1444,9 +1536,10 @@ impl TidalClient {
             expires_in: parsed.expires_in,
             token_type: parsed.token_type,
             user_id: parsed.user_id.or(old_user_id),
+            obtained_at: 0,
         };
 
-        self.tokens = Some(new_tokens.clone());
+        let new_tokens = self.set_tokens(Some(new_tokens), Stamp::Now).cloned().expect("just set");
         // Persist immediately: the auto-refresh on 401 is the common path, and
         // without this the stored token stays stale forever.
         if let Some(persist) = &self.token_persist {
@@ -1662,8 +1755,7 @@ impl TidalClient {
         let tokens = serde_json::from_str::<AuthTokens>(&body)
             .map_err(|e| TidalError::Parse(format!("{} - Body: {}", e, body)))?;
 
-        self.tokens = Some(tokens.clone());
-        Ok(Some(tokens))
+        Ok(self.set_tokens(Some(tokens), Stamp::Now).cloned())
     }
 
     pub async fn exchange_pkce_code(
@@ -1704,8 +1796,7 @@ impl TidalClient {
         let tokens = serde_json::from_str::<AuthTokens>(&body)
             .map_err(|e| TidalError::Parse(format!("{} - Body: {}", e, body)))?;
 
-        self.tokens = Some(tokens.clone());
-        Ok(tokens)
+        Ok(self.set_tokens(Some(tokens), Stamp::Now).cloned().expect("just set"))
     }
 
     pub async fn get_user_profile(
@@ -1763,7 +1854,7 @@ impl TidalClient {
         // Store the user's country code for all subsequent API calls
         if let Some(cc) = data.country_code {
             if !cc.is_empty() {
-                self.country_code = cc;
+                self.set_country_code(&cc);
             }
         }
         Ok(data.user_id)
@@ -7156,5 +7247,108 @@ mod encryption_tests {
     fn a_protected_mpd_reports_its_scheme() {
         let mpd = r#"<MPD><ContentProtection schemeIdUri="urn:uuid:edef8ba9" value="cenc"/></MPD>"#;
         assert_eq!(dash_encryption_type(mpd), "urn:uuid:edef8ba9");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod token_tests {
+    use super::*;
+
+    pub(crate) fn client() -> TidalClient {
+        let caps = crate::proxy::HostCaps::assume_all_present();
+        TidalClient::new(crate::proxy_http::ProxiedHttp::from_plan(&crate::proxy::ProxyPlan::Direct, &caps))
+    }
+
+    pub(crate) fn tokens(access: &str, user_id: u64, obtained_at: u64) -> AuthTokens {
+        AuthTokens {
+            access_token: access.into(),
+            refresh_token: format!("{access}-refresh"),
+            expires_in: 3600,
+            token_type: "Bearer".into(),
+            user_id: Some(user_id),
+            obtained_at,
+        }
+    }
+
+    #[test]
+    fn issued_tokens_are_stamped_before_they_are_handed_back() {
+        let mut c = client();
+        let before = unix_now();
+        let stored = c.set_tokens(Some(tokens("a", 1, 0)), Stamp::Now).cloned().unwrap();
+        assert!(stored.obtained_at >= before, "the returned copy carries the stamp");
+        assert_eq!(c.tokens().unwrap().obtained_at, stored.obtained_at);
+        assert_eq!(stored.expires_at(), stored.obtained_at + 3600);
+    }
+
+    #[test]
+    fn restored_tokens_keep_their_stamp() {
+        let mut c = client();
+        c.set_tokens(Some(tokens("a", 1, 1_000)), Stamp::Keep);
+        assert_eq!(c.tokens().unwrap().obtained_at, 1_000);
+        // Saved before the field existed: counts as long expired.
+        let old: AuthTokens = serde_json::from_str(
+            r#"{"access_token":"a","refresh_token":"r","expires_in":3600,"token_type":"Bearer"}"#,
+        )
+        .unwrap();
+        c.set_tokens(Some(old), Stamp::Keep);
+        assert_eq!(c.tokens().unwrap().obtained_at, 0);
+        assert!(c.tokens().unwrap().expires_at() < unix_now());
+    }
+
+    #[test]
+    fn the_stamp_is_saved_with_the_tokens() {
+        let t = tokens("a", 1, 1_234);
+        let back: AuthTokens = serde_json::from_value(serde_json::to_value(&t).unwrap()).unwrap();
+        assert_eq!(back.obtained_at, 1_234);
+    }
+
+    #[test]
+    fn the_credential_watch_follows_login_refresh_account_change_and_logout() {
+        let mut c = client();
+        let mut rx = c.credential_watch();
+        assert!(rx.borrow_and_update().is_none(), "signed out at first");
+
+        // Login.
+        c.set_tokens(Some(tokens("a", 1, 0)), Stamp::Now);
+        assert!(rx.has_changed().unwrap());
+        let seen = rx.borrow_and_update().clone().unwrap();
+        assert_eq!((seen.access_token.as_str(), seen.user_id), ("a", Some(1)));
+        assert_eq!(seen.country_code, DEFAULT_COUNTRY);
+        assert_eq!(seen.expires_at, c.tokens().unwrap().expires_at());
+
+        // The session's country arrives.
+        c.set_country_code("NO");
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().as_ref().unwrap().country_code, "NO");
+
+        // Refresh: a new access token for the same user.
+        c.set_tokens(Some(tokens("b", 1, 0)), Stamp::Now);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().as_ref().unwrap().access_token, "b");
+
+        // Another account.
+        c.set_tokens(Some(tokens("c", 2, 0)), Stamp::Now);
+        assert!(rx.has_changed().unwrap());
+        assert_eq!(rx.borrow_and_update().as_ref().unwrap().user_id, Some(2));
+
+        // Logout.
+        c.set_tokens(None, Stamp::Keep);
+        assert!(rx.has_changed().unwrap());
+        assert!(rx.borrow_and_update().is_none());
+        // Resetting the country while signed out changes nothing it carries.
+        c.set_country_code(DEFAULT_COUNTRY);
+        assert!(!rx.has_changed().unwrap());
+    }
+
+    #[test]
+    fn neither_snapshot_prints_a_token() {
+        let t = tokens("secret-access", 1, 0);
+        let mut c = client();
+        c.set_tokens(Some(t.clone()), Stamp::Keep);
+        let credential = c.credential_watch().borrow().clone().unwrap();
+        for text in [format!("{t:?}"), format!("{credential:?}")] {
+            assert!(!text.contains("secret"), "{text}");
+            assert!(text.contains("***"), "{text}");
+        }
     }
 }

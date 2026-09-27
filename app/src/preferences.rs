@@ -114,6 +114,15 @@ impl ZekePreferences {
             self,
             move |row| this.session().set_normalization(row.is_active())
         ));
+        // A page for the plugins, when this build has any.
+        let groups = window.plugins().preference_groups();
+        if !groups.is_empty() {
+            let page = adw::PreferencesPage::builder().title("Plugins").icon_name("application-x-addon-symbolic").build();
+            for group in &groups {
+                page.add(group);
+            }
+            self.add(&page);
+        }
         imp.color_scheme_row.connect_selected_notify(glib::clone!(
             #[weak]
             window,

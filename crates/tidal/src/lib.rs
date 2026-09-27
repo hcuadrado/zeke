@@ -3,6 +3,7 @@
 pub mod cache;
 pub mod client_lock;
 pub mod commands;
+pub mod credential;
 pub mod crypto;
 pub mod embedded_config;
 mod error;
@@ -17,8 +18,10 @@ pub mod util;
 pub use error::TidalError;
 
 use cache::DiskCache;
+use credential::{BoxFuture, Credential, CredentialSource, Refresh};
 use crypto::Crypto;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -111,6 +114,11 @@ pub struct Settings {
     pub proxy: ProxySettings,
     #[serde(default)]
     pub color_scheme: ColorScheme,
+    /// Each plugin's own entry, keyed by plugin id, in whatever shape the
+    /// plugin gives it. Opaque here, and kept whole by every save, so an
+    /// entry survives a build without its plugin and a token refresh.
+    #[serde(default)]
+    pub plugins: BTreeMap<String, serde_json::Value>,
 }
 
 impl Default for Settings {
@@ -128,6 +136,7 @@ impl Default for Settings {
             volume_normalization: false,
             proxy: Default::default(),
             color_scheme: ColorScheme::System,
+            plugins: BTreeMap::new(),
         }
     }
 }
@@ -200,6 +209,11 @@ pub struct AppState {
     pub cache_dir: PathBuf,
     pub disk_cache: DiskCache,
     pub crypto: Arc<Crypto>,
+    /// Taken from the client before it went behind the lock, so a source
+    /// can be made without waiting for a request in flight.
+    credential_watch: tokio::sync::watch::Receiver<Option<Credential>>,
+    /// Shared by every `CredentialSource`: one refresh at a time.
+    refresh_flight: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -207,11 +221,15 @@ impl AppState {
     /// from the keyring, then `zeke.key`, or is generated (`crypto.rs`).
     pub fn new(config_dir: &Path) -> Result<Self, TidalError> {
         fs::create_dir_all(config_dir)?;
+        let crypto = Arc::new(Crypto::new(config_dir)?);
+        Self::with_crypto(config_dir, crypto)
+    }
+
+    fn with_crypto(config_dir: &Path, crypto: Arc<Crypto>) -> Result<Self, TidalError> {
         let settings_path = config_dir.join("settings.json");
         let cache_dir = config_dir.join("cache");
         fs::create_dir_all(&cache_dir)?;
 
-        let crypto = Arc::new(Crypto::new(config_dir)?);
         let disk_cache = DiskCache::new(&cache_dir, crypto.clone());
 
         let caps = proxy::HostCaps::assume_all_present();
@@ -226,6 +244,7 @@ impl AppState {
             })
         });
 
+        let credential_watch = tidal_client.credential_watch();
         Ok(Self {
             tidal_client: Mutex::new(tidal_client),
             proxied_http,
@@ -233,7 +252,14 @@ impl AppState {
             cache_dir,
             disk_cache,
             crypto,
+            credential_watch,
+            refresh_flight: Arc::default(),
         })
+    }
+
+    /// The session's credential, for code that needs the access token.
+    pub fn credential_source(self: &Arc<Self>) -> CredentialSource {
+        CredentialSource::new(self.credential_watch.clone(), self.clone(), Arc::clone(&self.refresh_flight))
     }
 
     pub fn load_settings(&self) -> Option<Settings> {
@@ -269,6 +295,19 @@ impl AppState {
         let encrypted = self.crypto.encrypt(json.as_bytes())?;
         write_atomic(&self.settings_path, &encrypted)?;
         Ok(())
+    }
+}
+
+impl Refresh for AppState {
+    fn refresh<'a>(&'a self, stale: &'a str) -> BoxFuture<'a, Result<(), TidalError>> {
+        Box::pin(async move {
+            let mut client = self.tidal_client.lock().await;
+            // A refresh after a 401 may have beaten us to it.
+            if client.tokens().map(|t| t.access_token.as_str()) != Some(stale) {
+                return Ok(());
+            }
+            client.refresh_token().await.map(drop)
+        })
     }
 }
 
@@ -346,11 +385,59 @@ mod settings_tests {
             expires_in: 1,
             token_type: "Bearer".into(),
             user_id: Some(1),
+            obtained_at: 0,
         };
         persist_auth_tokens(&path, &crypto, &tokens);
         let raw = fs::read(&path).unwrap();
         assert!(crypto::is_encrypted(&raw), "settings must never be plaintext on disk");
         let back: Settings = serde_json::from_slice(&crypto.decrypt(&raw).unwrap()).unwrap();
         assert_eq!(back.auth_tokens.unwrap().refresh_token, "r");
+    }
+
+    fn state_with_a_plugin_entry() -> (tempfile::TempDir, AppState, serde_json::Value) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_crypto(dir.path(), Arc::new(Crypto::with_key([7u8; 32]))).unwrap();
+        let entry = serde_json::json!({ "enabled": true, "last": { "name": "Kitchen", "n": 3 } });
+        let saved = entry.clone();
+        state.update_settings(move |s| {
+            s.plugins.insert("cast".into(), saved);
+        })
+        .unwrap();
+        (dir, state, entry)
+    }
+
+    #[test]
+    fn a_plugin_entry_survives_a_settings_save() {
+        let (_dir, state, entry) = state_with_a_plugin_entry();
+        state.update_settings(|s| s.volume = 0.5).unwrap();
+        let s = state.load_settings().unwrap();
+        assert_eq!(s.volume, 0.5);
+        assert_eq!(s.plugins["cast"], entry);
+    }
+
+    #[test]
+    fn a_plugin_entry_survives_a_token_refresh() {
+        let (_dir, state, entry) = state_with_a_plugin_entry();
+        // What the client's persist hook does after every refresh: it
+        // rewrites the whole file.
+        let tokens = AuthTokens {
+            access_token: "a".into(),
+            refresh_token: "r".into(),
+            expires_in: 1,
+            token_type: "Bearer".into(),
+            user_id: Some(1),
+            obtained_at: 0,
+        };
+        persist_auth_tokens(&state.settings_path, &state.crypto, &tokens);
+        let s = state.load_settings().unwrap();
+        assert!(s.auth_tokens.is_some());
+        assert_eq!(s.plugins["cast"], entry);
+    }
+
+    #[test]
+    fn settings_without_plugins_load_with_none() {
+        let s: Settings = serde_json::from_str("{}").unwrap();
+        assert!(s.plugins.is_empty());
+        assert!(Settings::default().plugins.is_empty());
     }
 }

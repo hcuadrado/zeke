@@ -59,6 +59,17 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.2.1" date="2026-09-26">
+      <description>
+        <p>
+          Groundwork for plugins, with no change to how Zeke looks or plays.
+          The saved TIDAL session now records when its tokens were issued, so
+          Zeke can tell a token that is about to expire. Settings that a
+          future plugin saves are kept by every settings change and token
+          refresh.
+        </p>
+      </description>
+    </release>
     <release version="0.2.0" date="2026-09-25">
       <description>
         <p>

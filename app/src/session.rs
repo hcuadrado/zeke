@@ -235,6 +235,10 @@ impl Session {
         }
     }
 
+    pub fn set_plugin_enabled(&self, id: &'static str, on: bool) {
+        self.change_settings(move |s| crate::plugins::set_enabled(s, id, on));
+    }
+
     pub fn set_color_scheme(&self, scheme: ColorScheme) {
         if self.settings.borrow().color_scheme != scheme {
             self.change_settings(move |s| s.color_scheme = scheme);

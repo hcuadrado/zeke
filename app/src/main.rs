@@ -11,6 +11,7 @@ mod login_window;
 mod mpris;
 mod now_playing;
 mod output_picker;
+mod plugins;
 mod preferences;
 mod queue_row;
 mod runtime;
@@ -49,6 +50,7 @@ fn main() -> glib::ExitCode {
 
     let app = adw::Application::builder().application_id(APP_ID).build();
     let session: Rc<OnceCell<Rc<Session>>> = Rc::default();
+    let host: Rc<OnceCell<Rc<plugins::Host>>> = Rc::default();
     let pending = Rc::new(std::cell::RefCell::new(Some((state, settings.clone()))));
 
     app.connect_startup(glib::clone!(
@@ -63,6 +65,8 @@ fn main() -> glib::ExitCode {
     app.connect_activate(glib::clone!(
         #[strong]
         session,
+        #[strong]
+        host,
         move |app| {
             if let Some(window) = app.active_window() {
                 return window.present();
@@ -71,7 +75,9 @@ fn main() -> glib::ExitCode {
             let (s, events) = Session::start(state, settings);
             let s = Rc::new(s);
             session.set(Rc::clone(&s)).expect("activated once");
-            ZekeWindow::new(app, s, events).present();
+            let h = plugins::Host::new(Rc::clone(&s));
+            host.set(Rc::clone(&h)).expect("activated once");
+            ZekeWindow::new(app, s, h, events).present();
             if std::env::var_os("ZEKE_STALLS").is_some() {
                 watch_stalls();
             }
@@ -101,6 +107,10 @@ fn main() -> glib::ExitCode {
         }
     ));
     app.connect_shutdown(move |_| {
+        // Plugins first: they may be using the player.
+        if let Some(h) = host.get() {
+            h.shutdown();
+        }
         if let Some(s) = session.get() {
             s.shutdown();
         }

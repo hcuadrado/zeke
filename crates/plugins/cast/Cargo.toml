@@ -1,0 +1,16 @@
+[package]
+name = "zeke-plugin-cast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.9", features = ["v1_6"] }
+gtk = { package = "gtk4", version = "0.11", features = ["v4_14"] }
+log = "0.4"
+tokio = { version = "1", features = ["rt", "sync", "macros"] }
+zeke-plugin = { path = "../api" }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "macros", "time"] }
