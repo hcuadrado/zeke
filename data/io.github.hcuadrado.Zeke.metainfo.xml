@@ -59,6 +59,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.2.2" date="2026-09-26">
+      <description>
+        <p>
+          The player bar has shuffle and repeat, which were only in Now
+          Playing. Repeat shows a loop in every mode, and the speaker icon of
+          the output menu is the size of the icons around it.
+        </p>
+      </description>
+    </release>
     <release version="0.2.1" date="2026-09-26">
       <description>
         <p>
