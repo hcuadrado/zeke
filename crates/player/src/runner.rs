@@ -340,9 +340,14 @@ async fn radio(state: &AppState, seed: &QueueItem) -> Result<Vec<QueueTrack>, Re
     Ok(tracks)
 }
 
-/// Leave out what TIDAL marks unplayable; keep the order.
+/// Leave out what TIDAL marks unplayable, and videos; keep the order.
 fn playable(tracks: Vec<TidalTrack>) -> Vec<TidalTrack> {
-    tracks.into_iter().filter(|t| t.stream_ready != Some(false) && t.allow_streaming != Some(false)).collect()
+    tracks
+        .into_iter()
+        .filter(|t| {
+            t.stream_ready != Some(false) && t.allow_streaming != Some(false) && t.item_type.as_deref() != Some("video")
+        })
+        .collect()
 }
 
 /// `resolve_play_uri` (quality fallback, DASH → data: URI, ReplayGain choice)
@@ -519,9 +524,11 @@ mod tests {
             track(3, serde_json::json!({})),
             track(4, serde_json::json!({"allowStreaming": false, "streamReady": true})),
             track(5, serde_json::json!({"streamReady": true})),
+            track(6, serde_json::json!({"streamReady": true, "itemType": "video"})),
+            track(7, serde_json::json!({"itemType": "track"})),
         ];
         let ids: Vec<u64> = playable(tracks).iter().map(|t| t.id).collect();
-        assert_eq!(ids, vec![1, 3, 5], "unknown flags count as playable");
+        assert_eq!(ids, vec![1, 3, 5, 7], "unknown flags count as playable");
     }
 
     #[test]
