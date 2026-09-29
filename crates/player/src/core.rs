@@ -9,11 +9,17 @@
 //! The next track is resolved just in time, within `prefetch_window`
 //! seconds of the current track's end, not as soon as it is predicted,
 //! because stream URLs expire.
+//!
+//! Continuous playback: with repeat off, once the queue's last track is
+//! within `radio_window` of its end, its track radio is fetched and
+//! appended, so the prefetch finds a next track and the first radio track
+//! follows gaplessly. If the queue ends before the radio arrives, the
+//! player waits for it (`Loading`, nothing loading) instead of stopping.
 
 use zeke_tidal::commands::playback::compute_norm_gain;
 
 use crate::persist::PersistedQueue;
-use crate::queue::{Advance, NextUp, Queue, QueueItem, QueueTrack, RepeatMode};
+use crate::queue::{Advance, NextUp, Origin, Queue, QueueItem, QueueTrack, RepeatMode};
 
 /// Unplayable tracks skipped in a row before playback stops.
 const MAX_CONSECUTIVE_PLAY_FAILS: u32 = 3;
@@ -21,6 +27,9 @@ const MAX_CONSECUTIVE_PLAY_FAILS: u32 = 3;
 const FAILURE_MEMO_SECS: f64 = 10.0;
 /// Past this position, Previous restarts the track.
 const RESTART_THRESHOLD_SECS: f64 = 3.0;
+/// History kept when a radio is appended, so a queue that runs on radio
+/// for days stays small.
+const HISTORY_KEPT: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -38,6 +47,12 @@ pub struct Config {
     pub bit_perfect: bool,
     /// Exclusive ALSA output, as last set with `SetOutput`.
     pub exclusive: bool,
+    /// Settings' `continuous`: when the queue runs out with repeat off,
+    /// keep going with the last track's radio.
+    pub continuous: bool,
+    /// Fetch that radio this close to the last track's end: ahead of
+    /// `prefetch_window`, so the first radio track can be armed in time.
+    pub radio_window: f64,
 }
 
 impl Default for Config {
@@ -49,6 +64,8 @@ impl Default for Config {
             max_quality: "HI_RES_LOSSLESS".into(),
             bit_perfect: false,
             exclusive: false,
+            continuous: false,
+            radio_window: 75.0,
         }
     }
 }
@@ -185,6 +202,8 @@ pub enum PlayerCommand {
     /// Replace the queue with a saved one, `Restored` at its saved position:
     /// nothing is resolved or played until `Resume`.
     Restore(Box<PersistedQueue>),
+    /// Continuous playback on or off (`Config::continuous`).
+    SetContinuous(bool),
 }
 
 /// A resolved stream, as the runner reports it.
@@ -236,6 +255,8 @@ pub enum Input {
     /// The rates the exclusive device takes, probed after `ConfigureOutput`
     /// in bit-perfect mode; `None` when unknown (not probed, or busy).
     DeviceRates { output: u64, rates: Option<Vec<u32>> },
+    /// A radio's playable tracks, in TIDAL's order, for `FetchRadio`.
+    RadioFetched { fetch: u64, result: Result<Vec<QueueTrack>, ResolveError> },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -267,6 +288,9 @@ pub enum Effect {
     /// Configure the engine's output; in bit-perfect mode then probe the
     /// device's rates and answer with `DeviceRates` for this `output`.
     ConfigureOutput { output: u64, exclusive: bool, device: Option<String>, bit_perfect: bool },
+    /// Fetch the track radio of `seed`; answer with `RadioFetched`, always
+    /// (a failure or a timeout too), or a wait for it never ends.
+    FetchRadio { fetch: u64, seed: QueueItem },
     Emit(PlayerEvent),
 }
 
@@ -317,6 +341,12 @@ pub enum PlayerEvent {
     /// nothing, so a next track prerolled before a `SetOutput` still plays
     /// on the old output; the track after it starts on the new one.
     OutputActive { exclusive: bool, device: Option<String> },
+    /// Continuous playback is fetching `seed`'s radio.
+    RadioFetchStarted { seed: QueueItem },
+    /// `count` tracks of `seed`'s radio were appended to the queue.
+    RadioAppended { seed: QueueItem, count: usize },
+    /// Something the user should hear about that is not an error.
+    Notice(String),
 }
 
 #[derive(Debug, Clone)]
@@ -340,6 +370,32 @@ enum Slot {
 struct Prefetch {
     item: QueueItem,
     slot: Slot,
+}
+
+/// Continuous playback's radio for the current track: at most one fetch
+/// per track, whatever its outcome.
+#[derive(Debug, Clone)]
+struct Radio {
+    /// The entry the radio was fetched for.
+    qid: String,
+    /// `radio_gen` of the fetch; an answer for another is stale.
+    fetch: u64,
+    status: RadioStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RadioStatus {
+    Pending,
+    Appended,
+    /// Failed, or nothing new in it: not fetched again for this track.
+    Failed,
+}
+
+/// The queue ended while its radio was on the way.
+#[derive(Debug, Clone)]
+struct Waiting {
+    /// How the radio's first track will have become current.
+    via: Transition,
 }
 
 #[derive(Debug, Clone)]
@@ -394,6 +450,12 @@ pub struct Core {
     active: Option<(bool, Option<String>)>,
     /// `Queue::revision` last published as `QueueChanged`.
     published_queue: Option<u64>,
+    /// Cleared with the load and the prefetch whenever another track
+    /// starts loading or playback stops.
+    radio: Option<Radio>,
+    /// Generation of radio fetches.
+    radio_gen: u64,
+    waiting: Option<Waiting>,
 }
 
 impl Core {
@@ -420,6 +482,9 @@ impl Core {
             device: None,
             active: None,
             published_queue: None,
+            radio: None,
+            radio_gen: 0,
+            waiting: None,
         }
     }
 
@@ -493,6 +558,7 @@ impl Core {
                     self.device_rates = rates.filter(|r| !r.is_empty());
                 }
             }
+            Input::RadioFetched { fetch, result } => self.radio_fetched(fetch, result, &mut fx),
         }
         if self.published_queue != Some(self.queue.revision()) {
             self.published_queue = Some(self.queue.revision());
@@ -633,15 +699,18 @@ impl Core {
                     Advance::Next(item) | Advance::Wrapped(item) | Advance::Same(item) => {
                         self.start_load(item, Transition::Skip, fx)
                     }
-                    Advance::End => {
-                        self.stop(fx);
-                        fx.push(Effect::Emit(PlayerEvent::QueueEnded));
-                    }
+                    Advance::End => self.queue_ended(Transition::Skip, fx),
                 }
             }
             PlayerCommand::Previous => {
                 self.consecutive_fails = 0;
-                if self.position > RESTART_THRESHOLD_SECS || self.current.is_none() {
+                if self.waiting.is_some() {
+                    // Nothing is loaded to seek in: play the track before,
+                    // or the last one again.
+                    if let Some(item) = self.queue.back().or_else(|| self.queue.current().cloned()) {
+                        self.start_load(item, Transition::Previous, fx);
+                    }
+                } else if self.position > RESTART_THRESHOLD_SECS || self.current.is_none() {
                     self.seek(0.0, fx);
                 } else if let Some(item) = self.queue.back() {
                     self.start_load(item, Transition::Previous, fx);
@@ -658,14 +727,31 @@ impl Core {
             }
             PlayerCommand::SetRepeat(mode) => {
                 self.queue.set_repeat(mode);
+                if mode != RepeatMode::Off && self.waiting.take().is_some() {
+                    // Repeat now says what comes after the last track.
+                    match self.queue.advance(false) {
+                        Advance::Same(item) => self.start_load(item, Transition::Repeat, fx),
+                        Advance::Wrapped(item) => self.start_load(item, Transition::Wrap, fx),
+                        Advance::Next(item) => self.start_load(item, Transition::Skip, fx),
+                        Advance::End => self.end_queue(fx),
+                    }
+                    return;
+                }
+                if mode != RepeatMode::Off {
+                    // Repeat decides what follows now: a radio still on
+                    // the way is never appended.
+                    self.radio = None;
+                }
                 self.maybe_prefetch(fx);
             }
             PlayerCommand::Append(tracks) => {
                 self.queue.append(tracks);
+                self.play_pick_if_waiting(fx);
                 self.maybe_prefetch(fx);
             }
             PlayerCommand::PlayNext(track) => {
                 self.queue.play_next(track);
+                self.play_pick_if_waiting(fx);
                 self.maybe_prefetch(fx);
             }
             PlayerCommand::RemoveUpcoming(n) => {
@@ -687,6 +773,150 @@ impl Core {
             }
             PlayerCommand::SetVolume(v) => fx.push(Effect::SetVolume(v)),
             PlayerCommand::Restore(saved) => self.restore(&saved, fx),
+            PlayerCommand::SetContinuous(on) => {
+                self.config.continuous = on;
+                if on {
+                    self.maybe_fetch_radio(fx);
+                    return;
+                }
+                // A radio still on the way is never appended now.
+                self.radio = None;
+                if let Some(waiting) = self.waiting.take() {
+                    match self.queue.advance(true) {
+                        Advance::Next(item) | Advance::Wrapped(item) | Advance::Same(item) => {
+                            self.start_load(item, waiting.via, fx)
+                        }
+                        Advance::End => self.end_queue(fx),
+                    }
+                }
+            }
+        }
+    }
+
+    /// While waiting for a radio, a track the user queues plays at once;
+    /// the radio's answer is then stale.
+    fn play_pick_if_waiting(&mut self, fx: &mut Vec<Effect>) {
+        let Some(waiting) = self.waiting.take() else { return };
+        match self.queue.advance(true) {
+            Advance::Next(item) | Advance::Wrapped(item) | Advance::Same(item) => self.start_load(item, waiting.via, fx),
+            Advance::End => self.waiting = Some(waiting),
+        }
+    }
+
+    fn end_queue(&mut self, fx: &mut Vec<Effect>) {
+        self.stop(fx);
+        fx.push(Effect::Emit(PlayerEvent::QueueEnded));
+    }
+
+    /// The queue ran out (`via`: a skip past its end, or its last track
+    /// ended). With continuous playback, unless this track's radio already
+    /// came and went, wait for it, fetching it first if none is on the way.
+    fn queue_ended(&mut self, via: Transition, fx: &mut Vec<Effect>) {
+        let status = self.radio_status();
+        let wait = self.config.continuous
+            && self.queue.repeat() == RepeatMode::Off
+            && self.queue.current().is_some()
+            && matches!(status, None | Some(RadioStatus::Pending));
+        if !wait {
+            return self.end_queue(fx);
+        }
+        if status.is_none() {
+            self.fetch_radio(fx);
+        }
+        if via == Transition::Skip {
+            // The track skipped from must not keep playing.
+            fx.push(Effect::Stop);
+        }
+        self.clear_prefetch("waiting for the radio", fx);
+        self.load += 1; // a late result for the last load is stale
+        self.loading = None;
+        self.position = 0.0;
+        self.set_state(PlaybackState::Loading, fx);
+        self.waiting = Some(Waiting { via });
+    }
+
+    /// The radio's status, if it was fetched for the current entry.
+    fn radio_status(&self) -> Option<RadioStatus> {
+        let radio = self.radio.as_ref()?;
+        (self.queue.current()?.qid == radio.qid).then_some(radio.status)
+    }
+
+    fn fetch_radio(&mut self, fx: &mut Vec<Effect>) {
+        let Some(seed) = self.queue.current().cloned() else { return };
+        self.radio_gen += 1;
+        self.radio = Some(Radio { qid: seed.qid.clone(), fetch: self.radio_gen, status: RadioStatus::Pending });
+        fx.push(Effect::Emit(PlayerEvent::RadioFetchStarted { seed: seed.clone() }));
+        fx.push(Effect::FetchRadio { fetch: self.radio_gen, seed });
+    }
+
+    /// Fetch the radio once the last track is within `radio_window` of its
+    /// end, while it plays: a pause at the end of an album fills nothing.
+    /// On `peek_next`, not the prefetch's prediction, so it fetches with
+    /// gapless off or after an output change too.
+    fn maybe_fetch_radio(&mut self, fx: &mut Vec<Effect>) {
+        let due = self.config.continuous
+            && self.queue.repeat() == RepeatMode::Off
+            && self.state == PlaybackState::Playing
+            && self.queue.current().is_some()
+            && self.queue.peek_next().is_none()
+            && self.radio_status().is_none()
+            // Unknown length: fetch now rather than risk the end.
+            && self.remaining().is_none_or(|r| r <= self.config.radio_window);
+        if due {
+            self.fetch_radio(fx);
+        }
+    }
+
+    fn radio_fetched(&mut self, fetch: u64, result: Result<Vec<QueueTrack>, ResolveError>, fx: &mut Vec<Effect>) {
+        let Some(radio) = &self.radio else { return };
+        let Some(seed) = self.queue.current().cloned() else { return };
+        if radio.fetch != fetch || radio.status != RadioStatus::Pending || radio.qid != seed.qid {
+            return; // superseded
+        }
+        let failure = match result {
+            Ok(tracks) => {
+                // Leave out anything queued already, the seed (the radio's
+                // first track) included, and repeats within the radio.
+                let mut seen: std::collections::HashSet<u64> = self.queue.in_order().map(|i| i.track_id).collect();
+                let fresh: Vec<QueueTrack> = tracks.into_iter().filter(|t| seen.insert(t.id)).collect();
+                if fresh.is_empty() {
+                    log::info!("[player] the radio of {} has nothing that isn't queued already", seed.track_id);
+                    Some(None)
+                } else {
+                    let count = fresh.len();
+                    self.queue.trim_history(HISTORY_KEPT);
+                    self.queue.append_in_order(fresh, Origin::Radio { seed: seed.track_id });
+                    // No longer one album in order.
+                    self.use_track_gain = true;
+                    fx.push(Effect::Emit(PlayerEvent::RadioAppended { seed, count }));
+                    None
+                }
+            }
+            Err(e) => {
+                log::warn!("[player] the radio of {} failed: {}", seed.track_id, e.message);
+                Some(Some(e))
+            }
+        };
+        if let Some(radio) = self.radio.as_mut() {
+            radio.status = if failure.is_some() { RadioStatus::Failed } else { RadioStatus::Appended };
+        }
+        let Some(waiting) = self.waiting.take() else {
+            return self.maybe_prefetch(fx);
+        };
+        match self.queue.advance(true) {
+            Advance::Next(item) | Advance::Wrapped(item) | Advance::Same(item) => self.start_load(item, waiting.via, fx),
+            // A failed radio is an error, like an unplayable load: no
+            // QueueEnded, so a headless caller doesn't read it as success.
+            Advance::End => {
+                self.stop(fx);
+                match failure.flatten() {
+                    Some(e) => fx.push(Effect::Emit(PlayerEvent::Error { kind: e.kind, message: e.message })),
+                    None => {
+                        fx.push(Effect::Emit(PlayerEvent::Notice("No more tracks: no radio to continue with".into())));
+                        fx.push(Effect::Emit(PlayerEvent::QueueEnded));
+                    }
+                }
+            }
         }
     }
 
@@ -695,7 +925,7 @@ impl Core {
             log::warn!("[player] the saved queue is inconsistent; starting empty");
             return;
         };
-        self.stop(fx);
+        self.stop(fx); // clears the radio and any wait for one
         // Revisions restart at zero; keep them moving forward so the new
         // queue is published.
         let published = self.queue.revision();
@@ -751,6 +981,8 @@ impl Core {
 
     fn start_load(&mut self, item: QueueItem, via: Transition, fx: &mut Vec<Effect>) {
         self.load += 1;
+        self.radio = None;
+        self.waiting = None;
         // Whatever was armed belongs to the track being replaced.
         self.clear_prefetch("a new track is loading", fx);
         self.loading = Some(Loading {
@@ -775,6 +1007,8 @@ impl Core {
     fn stop(&mut self, fx: &mut Vec<Effect>) {
         self.load += 1; // results of an in-flight load are now stale
         self.loading = None;
+        self.radio = None;
+        self.waiting = None;
         self.clear_prefetch("stopped", fx);
         fx.push(Effect::Stop);
         self.position = 0.0;
@@ -797,6 +1031,8 @@ impl Core {
         let Some(at) = restored_at else { return self.stop(fx) };
         self.load += 1;
         self.loading = None;
+        self.radio = None;
+        self.waiting = None;
         self.clear_prefetch("stopped", fx);
         // Releases whatever the failed start opened.
         fx.push(Effect::Stop);
@@ -858,6 +1094,8 @@ impl Core {
     /// next track, and start resolving
     /// it once the current track is within the prefetch window of its end.
     fn maybe_prefetch(&mut self, fx: &mut Vec<Effect>) {
+        // First: the returns below are exactly the case the radio is for.
+        self.maybe_fetch_radio(fx);
         if !matches!(self.state, PlaybackState::Playing | PlaybackState::Paused) {
             return;
         }
@@ -980,11 +1218,7 @@ impl Core {
                     Advance::Next(next) | Advance::Wrapped(next) | Advance::Same(next) => {
                         return self.start_load(next, Transition::Skip, fx);
                     }
-                    Advance::End => {
-                        self.stop(fx);
-                        fx.push(Effect::Emit(PlayerEvent::QueueEnded));
-                        return;
-                    }
+                    Advance::End => return self.queue_ended(Transition::Skip, fx),
                 }
             }
             self.consecutive_fails = 0;
@@ -1193,10 +1427,7 @@ impl Core {
             Advance::Same(item) => self.start_load(item, Transition::Repeat, fx),
             Advance::Next(item) => self.start_load(item, Transition::AfterEnd, fx),
             Advance::Wrapped(item) => self.start_load(item, Transition::Wrap, fx),
-            Advance::End => {
-                self.stop(fx);
-                fx.push(Effect::Emit(PlayerEvent::QueueEnded));
-            }
+            Advance::End => self.queue_ended(Transition::AfterEnd, fx),
         }
     }
 }
@@ -1219,7 +1450,7 @@ fn finite(x: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::TrackInfo;
+    use crate::queue::{Origin, TrackInfo};
 
     fn resolved(tag: &str, duration: f64) -> Resolved {
         resolved_as(tag, duration, 24, 48000)
@@ -1260,6 +1491,11 @@ mod tests {
 
         /// Complete a pending Resolve → Play → PlayStarted with the given length.
         fn finish_load(&mut self, fx: &[Effect], duration: f64) -> Vec<Effect> {
+            self.finish_load_len(fx, Some(duration))
+        }
+
+        /// As `finish_load`; `None`: TIDAL gave no length.
+        fn finish_load_len(&mut self, fx: &[Effect], duration: Option<f64>) -> Vec<Effect> {
             let (load, item) = fx
                 .iter()
                 .find_map(|e| match e {
@@ -1267,10 +1503,9 @@ mod tests {
                     _ => None,
                 })
                 .expect("a Resolve effect");
-            let fx = self.send(Input::PlayResolved {
-                load,
-                result: Ok(resolved(&item.track_id.to_string(), duration)),
-            });
+            let mut r = resolved(&item.track_id.to_string(), 0.0);
+            r.duration = duration;
+            let fx = self.send(Input::PlayResolved { load, result: Ok(r) });
             assert!(fx.iter().any(|e| matches!(e, Effect::Play { .. })));
             self.send(Input::PlayStarted { load, result: Ok(()) })
         }
@@ -2175,9 +2410,9 @@ mod tests {
         let info = |title: &str| TrackInfo { title: title.into(), duration: Some(200.0), ..TrackInfo::default() };
         PersistedQueue {
             tracks: vec![
-                SavedTrack { id: 1, info: Some(info("One")) },
-                SavedTrack { id: 2, info: Some(info("Two")) },
-                SavedTrack { id: 3, info: None },
+                SavedTrack { id: 1, info: Some(info("One")), origin: Origin::Queued },
+                SavedTrack { id: 2, info: Some(info("Two")), origin: Origin::Queued },
+                SavedTrack { id: 3, info: None, origin: Origin::Radio { seed: 2 } },
             ],
             shuffle_order: None,
             active_index: 1,
@@ -2447,5 +2682,458 @@ mod tests {
         assert_eq!(items, Some((4, 1)));
         assert_eq!(h.core.persisted().unwrap().tracks.len(), 4);
         assert_eq!(h.core.state(), PlaybackState::Restored, "still waiting, nothing played");
+    }
+
+    // Continuous playback.
+
+    fn continuous() -> Harness {
+        Harness { core: Core::new(Config { continuous: true, ..Config::default() }, 1), now: 0.0 }
+    }
+
+    impl Harness {
+        fn tick(&mut self, position: f64) -> Vec<Effect> {
+            self.send(Input::Tick { position, track: self.core.track_seq() })
+        }
+
+        /// A queue of `tracks`, playing the entry at `start` (200 s long).
+        fn play_at(&mut self, tracks: &[u64], start: usize) -> Vec<Effect> {
+            let fx = self.cmd(PlayerCommand::Load {
+                tracks: QueueTrack::from_ids(tracks),
+                start: Some(start),
+                album_mode: true,
+                shuffle: false,
+                repeat: RepeatMode::Off,
+            });
+            self.finish_load(&fx, 200.0)
+        }
+
+        fn answer(&mut self, fetch: u64, ids: &[u64]) -> Vec<Effect> {
+            self.send(Input::RadioFetched { fetch, result: Ok(QueueTrack::from_ids(ids)) })
+        }
+
+        fn waiting(&self) -> bool {
+            self.core.state() == PlaybackState::Loading && self.core.loading.is_none() && self.core.waiting.is_some()
+        }
+
+        fn play_order(&self) -> Vec<u64> {
+            self.core.queue().in_order().map(|i| i.track_id).collect()
+        }
+    }
+
+    fn fetch_radio(fx: &[Effect]) -> Option<(u64, u64)> {
+        fx.iter().find_map(|e| match e {
+            Effect::FetchRadio { fetch, seed } => Some((*fetch, seed.track_id)),
+            _ => None,
+        })
+    }
+
+    fn appended(fx: &[Effect]) -> Option<(u64, usize)> {
+        fx.iter().find_map(|e| match e {
+            Effect::Emit(PlayerEvent::RadioAppended { seed, count }) => Some((seed.track_id, *count)),
+            _ => None,
+        })
+    }
+
+    fn started_item(fx: &[Effect]) -> Option<(QueueItem, Transition)> {
+        fx.iter().find_map(|e| match e {
+            Effect::Emit(PlayerEvent::TrackStarted { item, via, .. }) => Some((item.clone(), *via)),
+            _ => None,
+        })
+    }
+
+    fn ended(fx: &[Effect]) -> bool {
+        has(fx, &Effect::Emit(PlayerEvent::QueueEnded))
+    }
+
+    #[test]
+    fn the_radio_is_fetched_inside_its_window_once() {
+        let mut h = continuous();
+        h.play_at(&[1, 2], 1);
+        assert_eq!(fetch_radio(&h.tick(100.0)), None, "100 s left");
+        let fx = h.tick(126.0);
+        assert_eq!(fetch_radio(&fx).map(|(_, seed)| seed), Some(2), "74 s left");
+        assert!(fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::RadioFetchStarted { seed }) if seed.track_id == 2)));
+        assert_eq!(fetch_radio(&h.tick(127.0)), None, "one fetch per track");
+    }
+
+    #[test]
+    fn no_radio_with_repeat_or_continuous_off_or_a_next_track() {
+        for repeat in [RepeatMode::All, RepeatMode::One] {
+            let mut h = continuous();
+            h.load(&[1], repeat, false);
+            assert_eq!(fetch_radio(&h.tick(190.0)), None, "{repeat:?}");
+        }
+        let mut h = Harness::new();
+        h.load(&[1], RepeatMode::Off, false);
+        assert_eq!(fetch_radio(&h.tick(190.0)), None, "continuous off");
+        let mut h = continuous();
+        h.load(&[1, 2], RepeatMode::Off, false);
+        let fx = h.tick(190.0);
+        assert_eq!(fetch_radio(&fx), None, "a track is upcoming");
+        assert!(resolve_next(&fx).is_some());
+    }
+
+    #[test]
+    fn no_radio_while_paused_until_play_resumes() {
+        let mut h = continuous();
+        h.load(&[1], RepeatMode::Off, false);
+        h.cmd(PlayerCommand::Pause);
+        assert_eq!(fetch_radio(&h.tick(190.0)), None);
+        assert_eq!(fetch_radio(&h.cmd(PlayerCommand::Resume)), None);
+        assert_eq!(fetch_radio(&h.tick(190.2)).map(|(_, seed)| seed), Some(1), "the next tick");
+    }
+
+    #[test]
+    fn a_track_of_unknown_length_fetches_at_once() {
+        let mut h = continuous();
+        let fx = h.cmd(PlayerCommand::Load {
+            tracks: QueueTrack::from_ids(&[1]),
+            start: Some(0),
+            album_mode: false,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+        });
+        let fx = h.finish_load_len(&fx, None);
+        assert_eq!(fetch_radio(&fx).map(|(_, seed)| seed), Some(1));
+    }
+
+    #[test]
+    fn the_radio_is_fetched_without_gapless_or_after_an_output_change() {
+        let mut h = continuous();
+        h.load(&[1], RepeatMode::Off, false);
+        h.cmd(PlayerCommand::SetGapless(false));
+        assert!(fetch_radio(&h.tick(190.0)).is_some(), "gapless off");
+        let mut h = continuous();
+        h.load(&[1], RepeatMode::Off, false);
+        h.cmd(PlayerCommand::SetOutput { exclusive: false, device: None, bit_perfect: false });
+        assert!(fetch_radio(&h.tick(190.0)).is_some(), "output changed");
+    }
+
+    #[test]
+    fn a_page_appending_before_the_window_means_no_radio() {
+        let mut h = continuous();
+        h.load(&[1], RepeatMode::Off, false);
+        h.tick(1.0);
+        h.cmd(PlayerCommand::Append(QueueTrack::from_ids(&[2, 3])));
+        for t in [100.0, 130.0, 190.0] {
+            assert_eq!(fetch_radio(&h.tick(t)), None);
+        }
+    }
+
+    #[test]
+    fn an_answer_leaves_out_what_is_queued_and_goes_last_in_order() {
+        // Shuffled, with a track appended while the radio was on the way.
+        let mut h = continuous();
+        let fx = h.cmd(PlayerCommand::Load {
+            tracks: QueueTrack::from_ids(&[1, 2, 3]),
+            start: Some(0),
+            album_mode: true,
+            shuffle: true,
+            repeat: RepeatMode::Off,
+        });
+        h.finish_load(&fx, 200.0);
+        let last = h.core.queue().in_order().last().unwrap().qid.clone();
+        let fx = h.cmd(PlayerCommand::JumpTo(last));
+        h.finish_load(&fx, 200.0);
+        let seed = h.current();
+        let (fetch, _) = fetch_radio(&h.tick(130.0)).expect("a fetch");
+        h.cmd(PlayerCommand::Append(QueueTrack::from_ids(&[50])));
+        let before = h.play_order();
+        let fx = h.answer(fetch, &[seed, 1, 60, 50, 2, 61, 3, 60, 62]);
+        assert_eq!(appended(&fx), Some((seed, 3)));
+        assert!(fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::QueueChanged { .. }))));
+        let order = h.play_order();
+        assert_eq!(&order[..before.len()], &before[..], "the user's track stays ahead");
+        assert_eq!(&order[before.len()..], &[60, 61, 62], "TIDAL's order, shuffle or not");
+        let origins: Vec<Origin> = h.core.queue().in_order().map(|i| i.origin).collect();
+        assert_eq!(origins[before.len()..], [Origin::Radio { seed }; 3]);
+        // The prefetch, inside its window: the user's track first.
+        let fx = h.tick(175.0);
+        assert!(fx.iter().any(|e| matches!(e, Effect::ResolveNext { item, use_track_gain: true, .. } if item.track_id == 50)));
+
+        // Without the user's track: the radio's first.
+        let mut h = continuous();
+        h.play_at(&[1], 0);
+        let (fetch, _) = fetch_radio(&h.tick(130.0)).unwrap();
+        assert_eq!(appended(&h.answer(fetch, &[1, 70, 71])), Some((1, 2)));
+        assert_eq!(resolve_next(&h.tick(175.0)).unwrap().1.track_id, 70);
+    }
+
+    #[test]
+    fn a_radio_is_never_appended_twice() {
+        let mut h = continuous();
+        h.play_at(&[1], 0);
+        let (f1, _) = fetch_radio(&h.tick(130.0)).unwrap();
+        h.cmd(PlayerCommand::Append(QueueTrack::from_ids(&[2])));
+        let (pf, item) = resolve_next(&h.tick(175.0)).unwrap();
+        let qid = arm(&mut h, &[Effect::ResolveNext { prefetch: pf, item, use_track_gain: false, normalization: false, quality: String::new() }], 200.0);
+        let fx = advanced(&mut h, 2, &qid);
+        assert_eq!(started(&fx), Some((2, Transition::Gapless)));
+        let (f2, seed) = fetch_radio(&h.tick(130.0)).expect("a fetch for the new last track");
+        assert_eq!(seed, 2);
+        assert_ne!(f1, f2);
+        assert_eq!(appended(&h.answer(f1, &[10, 11])), None, "the first track's radio is stale");
+        assert_eq!(h.play_order(), vec![1, 2]);
+        assert_eq!(appended(&h.answer(f2, &[12, 13])), Some((2, 2)));
+        assert_eq!(h.play_order(), vec![1, 2, 12, 13]);
+        for t in [131.0, 150.0, 190.0] {
+            assert_eq!(fetch_radio(&h.tick(t)), None);
+        }
+    }
+
+    #[test]
+    fn a_jump_back_onto_the_last_track_cannot_leave_a_wait_stuck() {
+        let mut h = continuous();
+        h.play_at(&[1, 2], 1);
+        let (f1, _) = fetch_radio(&h.tick(130.0)).unwrap();
+        let qid = h.core.queue().current().unwrap().qid.clone();
+        let fx = h.cmd(PlayerCommand::JumpTo(qid));
+        h.finish_load(&fx, 200.0);
+        let fx = h.send(Input::TrackFinished);
+        let (f2, seed) = fetch_radio(&fx).expect("a new fetch: the old one's memo is gone");
+        assert_eq!(seed, 2);
+        assert!(h.waiting());
+        assert!(resolve(&h.answer(f1, &[10])).is_none(), "the orphan is dropped");
+        assert!(h.waiting());
+        let fx = h.answer(f2, &[11]);
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(started(&fx), Some((11, Transition::AfterEnd)));
+    }
+
+    #[test]
+    fn a_stale_answer_is_dropped() {
+        type Act = fn(&mut Harness);
+        let acts: [(&str, Act); 6] = [
+            ("Load", |h| {
+                h.cmd(PlayerCommand::Load { tracks: QueueTrack::from_ids(&[7]), start: None, album_mode: false, shuffle: false, repeat: RepeatMode::Off });
+            }),
+            ("Stop", |h| {
+                h.cmd(PlayerCommand::Stop);
+            }),
+            ("JumpTo", |h| {
+                let first = h.core.queue().in_order().next().unwrap().qid.clone();
+                h.cmd(PlayerCommand::JumpTo(first));
+            }),
+            ("Previous", |h| {
+                h.tick(2.0);
+                h.cmd(PlayerCommand::Previous);
+            }),
+            ("Restore", |h| {
+                h.cmd(PlayerCommand::Restore(Box::new(saved_queue(0))));
+            }),
+            ("SetContinuous(false)", |h| {
+                h.cmd(PlayerCommand::SetContinuous(false));
+            }),
+        ];
+        for (name, act) in acts {
+            let mut h = continuous();
+            let fx = h.cmd(PlayerCommand::Load { tracks: QueueTrack::from_ids(&[1, 2]), start: Some(1), album_mode: false, shuffle: false, repeat: RepeatMode::Off });
+            let fx = h.finish_load_len(&fx, None);
+            let (fetch, _) = fetch_radio(&fx).expect("unknown length: at once");
+            act(&mut h);
+            let before = h.play_order();
+            let fx = h.answer(fetch, &[10, 11]);
+            assert_eq!(appended(&fx), None, "{name}");
+            assert_eq!(h.play_order(), before, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_radio_on_the_way_is_dropped_when_repeat_comes_on() {
+        for repeat in [RepeatMode::All, RepeatMode::One] {
+            let mut h = continuous();
+            h.play_at(&[1], 0);
+            let (fetch, _) = fetch_radio(&h.tick(130.0)).unwrap();
+            h.cmd(PlayerCommand::SetRepeat(repeat));
+            assert_eq!(appended(&h.answer(fetch, &[10, 11])), None, "{repeat:?}");
+            assert_eq!(h.play_order(), vec![1]);
+        }
+    }
+
+    #[test]
+    fn one_fetch_per_track() {
+        let mut h = Harness::new();
+        h.load(&[1], RepeatMode::Off, false);
+        h.tick(150.0);
+        let (fetch, _) = fetch_radio(&h.cmd(PlayerCommand::SetContinuous(true))).expect("in the window");
+        assert_eq!(fetch_radio(&h.cmd(PlayerCommand::SetContinuous(true))), None);
+        let err = ResolveError { message: "429".into(), kind: ErrorKind::Other };
+        let fx = h.send(Input::RadioFetched { fetch, result: Err(err) });
+        assert!(!ended(&fx) && h.core.state() == PlaybackState::Playing, "nothing waits on it");
+        assert_eq!(fetch_radio(&h.tick(151.0)), None, "a failure is not retried");
+        h.cmd(PlayerCommand::Stop);
+        let fx = h.cmd(PlayerCommand::Resume);
+        h.finish_load(&fx, 200.0);
+        assert!(fetch_radio(&h.tick(150.0)).is_some(), "stopped and played again: a new fetch");
+    }
+
+    #[test]
+    fn the_end_of_the_queue_waits_for_the_radio() {
+        // The last track ends with the radio on the way.
+        let mut h = continuous();
+        h.play_at(&[1], 0);
+        let (fetch, _) = fetch_radio(&h.tick(130.0)).unwrap();
+        h.tick(199.0);
+        let load = h.core.load;
+        let fx = h.send(Input::TrackFinished);
+        assert!(!ended(&fx) && !has(&fx, &Effect::Stop));
+        assert_eq!(fetch_radio(&fx), None, "one is on the way");
+        assert!(h.waiting());
+        assert!(h.core.load > load);
+        assert_eq!(h.core.saved_position(), 0.0);
+        let fx = h.answer(fetch, &[10, 11]);
+        assert_eq!(resolve(&fx).unwrap().track_id, 10);
+        let fx = h.finish_load(&fx, 200.0);
+        let (item, via) = started_item(&fx).unwrap();
+        assert_eq!((item.track_id, via, item.origin), (10, Transition::AfterEnd, Origin::Radio { seed: 1 }));
+
+        // Next at the last track, before the window.
+        let mut h = continuous();
+        h.play_at(&[1], 0);
+        let fx = h.cmd(PlayerCommand::Next);
+        assert!(has(&fx, &Effect::Stop), "the old track stops");
+        assert!(!ended(&fx));
+        let (fetch, _) = fetch_radio(&fx).expect("fetched now");
+        assert!(h.waiting());
+        let fx = h.answer(fetch, &[10]);
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(started(&fx), Some((10, Transition::Skip)));
+
+        // The last track can't be played: the skip loop waits too.
+        let mut h = continuous();
+        h.play_at(&[1, 2], 0);
+        h.cmd(PlayerCommand::Next);
+        let fx = h.send(Input::PlayResolved {
+            load: h.core.load,
+            result: Err(ResolveError { message: "404".into(), kind: ErrorKind::Unplayable }),
+        });
+        assert!(fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::Skipped { .. }))));
+        assert!(fetch_radio(&fx).is_some() && !ended(&fx));
+        assert!(h.waiting());
+
+        // Next on a restored queue at its last track.
+        let mut h = continuous();
+        let saved = PersistedQueue { active_index: 2, repeat: RepeatMode::Off, ..saved_queue(0) };
+        h.cmd(PlayerCommand::Restore(Box::new(saved)));
+        let fx = h.cmd(PlayerCommand::Next);
+        assert!(fetch_radio(&fx).is_some() && !ended(&fx));
+        assert!(h.waiting());
+    }
+
+    /// Continuous, a queue of `tracks` played to the end of its last one,
+    /// waiting for the radio: the fetch's generation.
+    fn waiting_at_end(tracks: &[u64]) -> (Harness, u64) {
+        let mut h = continuous();
+        h.play_at(tracks, tracks.len() - 1);
+        let fx = h.send(Input::TrackFinished);
+        let (fetch, _) = fetch_radio(&fx).unwrap();
+        assert!(h.waiting());
+        (h, fetch)
+    }
+
+    #[test]
+    fn commands_while_waiting_for_the_radio() {
+        // A jump wins over the late answer.
+        let (mut h, fetch) = waiting_at_end(&[1, 2]);
+        let first = h.core.queue().in_order().next().unwrap().qid.clone();
+        assert_eq!(resolve(&h.cmd(PlayerCommand::JumpTo(first))).unwrap().track_id, 1);
+        assert!(resolve(&h.answer(fetch, &[10])).is_none());
+        assert_eq!(h.play_order(), vec![1, 2]);
+
+        // Previous plays the track before, or the only one again.
+        let (mut h, _) = waiting_at_end(&[1, 2]);
+        let fx = h.cmd(PlayerCommand::Previous);
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(started(&fx), Some((1, Transition::Previous)));
+        let (mut h, _) = waiting_at_end(&[1]);
+        let fx = h.cmd(PlayerCommand::Previous);
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(started(&fx), Some((1, Transition::Previous)));
+
+        // A track the user queues plays at once.
+        let (mut h, fetch) = waiting_at_end(&[1]);
+        let fx = h.cmd(PlayerCommand::Append(QueueTrack::from_ids(&[9])));
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(started(&fx), Some((9, Transition::AfterEnd)));
+        assert_eq!(appended(&h.answer(fetch, &[10])), None);
+        let (mut h, _) = waiting_at_end(&[1]);
+        assert_eq!(resolve(&h.cmd(PlayerCommand::PlayNext(9.into()))).unwrap().track_id, 9);
+
+        // Play/pause is the way out.
+        let (mut h, fetch) = waiting_at_end(&[1]);
+        let fx = h.cmd(PlayerCommand::TogglePause);
+        assert!(has(&fx, &Effect::Stop));
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
+        assert!(resolve(&h.answer(fetch, &[10])).is_none());
+
+        // Switched off: the queue ends as it would have.
+        let (mut h, fetch) = waiting_at_end(&[1]);
+        assert!(ended(&h.cmd(PlayerCommand::SetContinuous(false))));
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
+        assert_eq!(appended(&h.answer(fetch, &[10])), None);
+
+        // Repeat: One replays the last track, All starts over.
+        let (mut h, _) = waiting_at_end(&[1, 2]);
+        let fx = h.cmd(PlayerCommand::SetRepeat(RepeatMode::One));
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(started(&fx), Some((2, Transition::Repeat)));
+        let (mut h, _) = waiting_at_end(&[1, 2]);
+        let fx = h.cmd(PlayerCommand::SetRepeat(RepeatMode::All));
+        let fx = h.finish_load(&fx, 200.0);
+        assert_eq!(started(&fx), Some((1, Transition::Wrap)));
+    }
+
+    #[test]
+    fn an_empty_or_failed_radio_ends_the_queue() {
+        // The stop, the reason, then (only for an empty radio) the end.
+        let events = |fx: &[Effect]| -> Vec<PlayerEvent> {
+            fx.iter()
+                .filter_map(|e| match e {
+                    Effect::Emit(
+                        ev @ (PlayerEvent::State(_) | PlayerEvent::Notice(_) | PlayerEvent::Error { .. } | PlayerEvent::QueueEnded),
+                    ) => Some(ev.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for ids in [&[][..], &[1, 1][..]] {
+            let (mut h, fetch) = waiting_at_end(&[1]);
+            let fx = h.answer(fetch, ids);
+            assert_eq!(
+                events(&fx),
+                vec![
+                    PlayerEvent::State(PlaybackState::Stopped),
+                    PlayerEvent::Notice("No more tracks: no radio to continue with".into()),
+                    PlayerEvent::QueueEnded,
+                ],
+                "{ids:?}"
+            );
+            assert_eq!(h.core.state(), PlaybackState::Stopped);
+        }
+        let (mut h, fetch) = waiting_at_end(&[1]);
+        let err = ResolveError { message: "401".into(), kind: ErrorKind::LoginExpired };
+        let fx = h.send(Input::RadioFetched { fetch, result: Err(err) });
+        assert_eq!(
+            events(&fx),
+            vec![
+                PlayerEvent::State(PlaybackState::Stopped),
+                PlayerEvent::Error { kind: ErrorKind::LoginExpired, message: "401".into() },
+            ]
+        );
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
+    }
+
+    #[test]
+    fn a_radio_the_user_removed_is_not_fetched_again() {
+        let mut h = continuous();
+        h.play_at(&[1], 0);
+        let (fetch, _) = fetch_radio(&h.tick(130.0)).unwrap();
+        h.answer(fetch, &[10, 11]);
+        h.cmd(PlayerCommand::RemoveUpcoming(0));
+        let fx = h.cmd(PlayerCommand::RemoveUpcoming(0));
+        assert_eq!(fetch_radio(&fx), None);
+        let fx = h.send(Input::TrackFinished);
+        assert!(ended(&fx));
+        assert_eq!(fetch_radio(&fx), None);
     }
 }

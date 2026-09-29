@@ -22,6 +22,11 @@ template $ZekePreferences: Adw.PreferencesDialog {
         title: "Gapless playback";
       }
 
+      Adw.SwitchRow continuous_row {
+        title: "Continuous playback";
+        subtitle: "When the queue ends, keep going with a radio from its last track";
+      }
+
       Adw.SwitchRow normalization_row {
         title: "ReplayGain";
         subtitle: "Even out loudness: album gain for an album in order, track gain otherwise";

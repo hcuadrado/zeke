@@ -39,6 +39,47 @@ pub struct TrackInfo {
     pub track_mix_id: Option<String>,
 }
 
+impl TrackInfo {
+    /// What a TIDAL track object (a list item or a track's detail) says
+    /// about the track, read the one way the pages, Now Playing and the
+    /// player all show it. `None` without a title.
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            title: display_title(v)?,
+            artists: artist_names(v),
+            album: text(&v["album"]["title"]).unwrap_or("").to_string(),
+            cover: text(&v["album"]["cover"]).map(str::to_string),
+            duration: v["duration"].as_f64().map(f64::round),
+            track_mix_id: zeke_tidal::commands::browse::track_mix(v),
+        })
+    }
+}
+
+fn text(v: &serde_json::Value) -> Option<&str> {
+    v.as_str().filter(|s| !s.is_empty())
+}
+
+/// The title with its version, e.g. "One More Time (Radio Edit)".
+pub fn display_title(v: &serde_json::Value) -> Option<String> {
+    let base = text(&v["title"])?;
+    Some(match text(&v["version"]) {
+        Some(version) => format!("{base} ({version})"),
+        None => base.to_string(),
+    })
+}
+
+/// Artist names, comma-separated: `artists[]` wins over the singular
+/// `artist`.
+pub fn artist_names(v: &serde_json::Value) -> String {
+    let names: Vec<&str> =
+        v["artists"].as_array().map(|a| a.iter().filter_map(|x| text(&x["name"])).collect()).unwrap_or_default();
+    if names.is_empty() {
+        text(&v["artist"]["name"]).unwrap_or("").to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// A track to queue: its ID and, when a page queued it, its metadata. An
 /// ID-only track (e.g. from a saved queue) has `info: None`.
 #[derive(Debug, Clone, PartialEq)]
@@ -70,6 +111,23 @@ impl From<&u64> for QueueTrack {
     }
 }
 
+/// How an entry got into the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// The user queued it (a page, Play Next, Add to Queue).
+    #[default]
+    Queued,
+    /// Continuous playback appended it from the radio of track `seed`.
+    Radio { seed: u64 },
+}
+
+impl Origin {
+    pub fn is_queued(&self) -> bool {
+        *self == Origin::Queued
+    }
+}
+
 /// A queue entry. `qid` tells apart two entries of the same track; it
 /// travels through the engine's gapless slot and comes back in
 /// `track-advanced`.
@@ -79,6 +137,7 @@ pub struct QueueItem {
     pub qid: String,
     /// Shared with every copy of the entry (the queue is republished often).
     pub info: Option<Arc<TrackInfo>>,
+    pub origin: Origin,
 }
 
 /// What `Queue::peek_next` predicts after the current track.
@@ -169,11 +228,16 @@ impl Queue {
     }
 
     fn stamp(&mut self, track: QueueTrack) -> QueueItem {
+        self.stamp_as(track, Origin::Queued)
+    }
+
+    fn stamp_as(&mut self, track: QueueTrack, origin: Origin) -> QueueItem {
         self.next_qid += 1;
         QueueItem {
             track_id: track.id,
             qid: format!("{}-{}", track.id, self.next_qid),
             info: track.info,
+            origin,
         }
     }
 
@@ -409,6 +473,48 @@ impl Queue {
         }
     }
 
+    /// Append at the end of the play order, in the order given, shuffle or
+    /// not: a radio's sequencing is part of what it offers. Anything
+    /// already upcoming stays ahead.
+    pub fn append_in_order(&mut self, tracks: impl IntoIterator<Item = QueueTrack>, origin: Origin) {
+        self.revision += 1;
+        for track in tracks {
+            let item = self.stamp_as(track, origin);
+            self.items.push(item);
+            if self.order.is_empty() {
+                self.pos = 0;
+            }
+            self.order.push(self.items.len() - 1);
+        }
+    }
+
+    /// Drop the oldest history entries so at most `keep` remain. The
+    /// current and upcoming entries are never touched. `items` shrinks with
+    /// the history (a shuffled queue saves all of `items`), and `order` is
+    /// remapped onto what is left.
+    pub fn trim_history(&mut self, keep: usize) {
+        let Some(drop) = self.pos.checked_sub(keep).filter(|&n| n > 0) else { return };
+        self.revision += 1;
+        let mut gone = vec![false; self.items.len()];
+        for &i in &self.order[..drop] {
+            gone[i] = true;
+        }
+        // Old index → new index, for the entries that stay.
+        let mut new_index = vec![0; self.items.len()];
+        let mut kept = 0;
+        for (i, &g) in gone.iter().enumerate() {
+            new_index[i] = kept;
+            kept += usize::from(!g);
+        }
+        let mut i = 0;
+        self.items.retain(|_| {
+            i += 1;
+            !gone[i - 1]
+        });
+        self.order = self.order[drop..].iter().map(|&i| new_index[i]).collect();
+        self.pos -= drop;
+    }
+
     /// Play next: right after the current track.
     pub fn play_next(&mut self, track: impl Into<QueueTrack>) {
         self.revision += 1;
@@ -446,7 +552,11 @@ impl Queue {
     /// off mid-queue, history is still in shuffled order. Each entry keeps
     /// its metadata.
     pub fn to_persisted(&self, position_ms: u64, album_mode: bool) -> crate::persist::PersistedQueue {
-        let saved = |t: &QueueItem| crate::persist::SavedTrack { id: t.track_id, info: t.info.as_deref().cloned() };
+        let saved = |t: &QueueItem| crate::persist::SavedTrack {
+            id: t.track_id,
+            info: t.info.as_deref().cloned(),
+            origin: t.origin,
+        };
         let (tracks, shuffle_order) = if self.shuffle {
             (self.items.iter().map(saved).collect(), Some(self.order.clone()))
         } else {
@@ -470,7 +580,7 @@ impl Queue {
         q.items = p
             .tracks
             .iter()
-            .map(|t| q.stamp(QueueTrack { id: t.id, info: t.info.clone().map(Arc::new) }))
+            .map(|t| q.stamp_as(QueueTrack { id: t.id, info: t.info.clone().map(Arc::new) }, t.origin))
             .collect();
         q.order = match &p.shuffle_order {
             Some(order) => {
@@ -748,6 +858,31 @@ mod tests {
     }
 
     #[test]
+    fn track_info_from_tidal_json() {
+        let v = serde_json::json!({
+            "id": 1550546,
+            "title": "One More Time",
+            "version": "Radio Edit",
+            "duration": 320.4,
+            "artists": [{"name": "Daft Punk"}, {"name": "Romanthony"}],
+            "artist": {"name": "Daft Punk"},
+            "album": {"title": "Discovery", "cover": "ab-cd-ef"},
+            "mixes": {"TRACK_MIX": "0012ab"},
+        });
+        let info = TrackInfo::from_json(&v).unwrap();
+        assert_eq!(info.title, "One More Time (Radio Edit)");
+        assert_eq!(info.artists, "Daft Punk, Romanthony");
+        assert_eq!(info.album, "Discovery");
+        assert_eq!(info.cover.as_deref(), Some("ab-cd-ef"));
+        assert_eq!(info.duration, Some(320.0), "rounded");
+        assert_eq!(info.track_mix_id.as_deref(), Some("0012ab"));
+        let single = serde_json::json!({"title": "T", "version": "", "artist": {"name": "X"}, "album": {"cover": ""}});
+        let info = TrackInfo::from_json(&single).unwrap();
+        assert_eq!((info.title.as_str(), info.artists.as_str(), info.cover, info.duration), ("T", "X", None, None));
+        assert_eq!(TrackInfo::from_json(&serde_json::json!({"title": ""})), None);
+    }
+
+    #[test]
     fn append_while_shuffled_keeps_existing_order() {
         let mut q = Queue::new(9);
         q.load(1..=6u64, Some(0), true);
@@ -756,6 +891,64 @@ mod tests {
         let after: Vec<u64> = play_order(&q).into_iter().filter(|t| *t < 100).collect();
         assert_eq!(after, before);
         assert_eq!(play_order(&q)[0], before[0], "never before the current track");
+    }
+
+    #[test]
+    fn a_radio_goes_to_the_end_of_the_play_order_in_its_own_order() {
+        let mut q = Queue::new(9);
+        q.load(1..=6u64, Some(0), true);
+        q.append([7]); // somewhere upcoming, shuffled
+        let before = play_order(&q);
+        q.append_in_order(QueueTrack::from_ids(&[100, 101, 102]), Origin::Radio { seed: 6 });
+        let after = play_order(&q);
+        assert_eq!(&after[..before.len()], &before[..], "what was queued stays ahead");
+        assert_eq!(&after[before.len()..], &[100, 101, 102]);
+        let origins: Vec<Origin> = q.in_order().skip(before.len()).map(|i| i.origin).collect();
+        assert_eq!(origins, vec![Origin::Radio { seed: 6 }; 3]);
+        assert!(q.in_order().take(before.len()).all(|i| i.origin.is_queued()));
+        // Onto an empty queue: the first entry becomes current.
+        let mut q = Queue::new(1);
+        q.append_in_order(QueueTrack::from_ids(&[5, 6]), Origin::Queued);
+        assert_eq!(q.current().unwrap().track_id, 5);
+    }
+
+    #[test]
+    fn trimming_history_keeps_the_queue_consistent() {
+        let mut q = Queue::new(13);
+        q.load(1..=10u64, Some(0), true);
+        for _ in 0..6 {
+            q.advance(false);
+        }
+        q.append_in_order(QueueTrack::from_ids(&[100, 101]), Origin::Radio { seed: 1 });
+        let order = play_order(&q);
+        let current = q.current().unwrap().clone();
+        let rev = q.revision();
+        q.trim_history(2);
+        assert!(q.revision() > rev);
+        assert_eq!(q.items.len(), q.order.len());
+        let mut sorted = q.order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..q.items.len()).collect::<Vec<_>>(), "order is a permutation of items");
+        assert_eq!(q.position(), (2, 8));
+        assert_eq!(q.current(), Some(&current));
+        assert_eq!(play_order(&q), order[4..], "the oldest four went, nothing else");
+        // Less history than `keep`: nothing changes.
+        let rev = q.revision();
+        q.trim_history(5);
+        assert_eq!((q.revision(), play_order(&q)), (rev, order[4..].to_vec()));
+        // The saved queue round-trips, origins included.
+        let back = Queue::from_persisted(&q.to_persisted(0, false), 1).unwrap();
+        assert_eq!(play_order(&back), play_order(&q));
+        assert_eq!(back.current().unwrap().track_id, current.track_id);
+        let origins = |q: &Queue| q.in_order().map(|i| i.origin).collect::<Vec<_>>();
+        assert_eq!(origins(&back), origins(&q));
+        assert_eq!(origins(&back).last(), Some(&Origin::Radio { seed: 1 }));
+        // Shuffle off: history in any order is trimmed the same way.
+        q.set_shuffle(false);
+        q.advance(false);
+        q.trim_history(0);
+        assert_eq!(q.position(), (0, 5));
+        assert_eq!(q.items.len(), 5);
     }
 
     #[test]
@@ -785,7 +978,7 @@ mod tests {
     fn inconsistent_persisted_queues_are_refused() {
         use crate::persist::PersistedQueue;
         let base = PersistedQueue {
-            tracks: [1, 2, 3].map(|id| crate::persist::SavedTrack { id, info: None }).to_vec(),
+            tracks: [1, 2, 3].map(|id| crate::persist::SavedTrack { id, info: None, origin: Origin::Queued }).to_vec(),
             shuffle_order: None,
             active_index: 0,
             position_ms: 0,

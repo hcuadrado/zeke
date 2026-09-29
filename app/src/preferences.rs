@@ -35,6 +35,8 @@ mod imp {
         #[template_child]
         pub gapless_row: TemplateChild<adw::SwitchRow>,
         #[template_child]
+        pub continuous_row: TemplateChild<adw::SwitchRow>,
+        #[template_child]
         pub normalization_row: TemplateChild<adw::SwitchRow>,
         #[template_child]
         pub color_scheme_row: TemplateChild<adw::ComboRow>,
@@ -91,6 +93,7 @@ impl ZekePreferences {
         let at = QUALITIES.iter().position(|(q, _)| *q == s.max_quality).unwrap_or(0);
         imp.quality_row.set_selected(at as u32);
         imp.gapless_row.set_active(s.gapless);
+        imp.continuous_row.set_active(s.continuous);
         imp.normalization_row.set_active(s.volume_normalization);
         let at = SCHEMES.iter().position(|(c, _)| *c == s.color_scheme).unwrap_or(0);
         imp.color_scheme_row.set_selected(at as u32);
@@ -108,6 +111,11 @@ impl ZekePreferences {
             #[weak(rename_to = this)]
             self,
             move |row| this.session().set_gapless(row.is_active())
+        ));
+        imp.continuous_row.connect_active_notify(glib::clone!(
+            #[weak(rename_to = this)]
+            self,
+            move |row| this.session().set_continuous(row.is_active())
         ));
         imp.normalization_row.connect_active_notify(glib::clone!(
             #[weak(rename_to = this)]

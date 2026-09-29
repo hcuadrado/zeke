@@ -5,7 +5,7 @@ use std::sync::mpsc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::queue::{RepeatMode, TrackInfo};
+use crate::queue::{Origin, RepeatMode, TrackInfo};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedQueue {
@@ -29,6 +29,9 @@ pub struct SavedTrack {
     pub id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub info: Option<TrackInfo>,
+    /// Left out for a queued track, so older builds read the file too.
+    #[serde(default, skip_serializing_if = "Origin::is_queued")]
+    pub origin: Origin,
 }
 
 impl PersistedQueue {
@@ -131,9 +134,9 @@ mod tests {
         };
         PersistedQueue {
             tracks: vec![
-                SavedTrack { id: 455128517, info: None },
-                SavedTrack { id: 55391790, info: Some(info) },
-                SavedTrack { id: 357676035, info: None },
+                SavedTrack { id: 455128517, info: None, origin: Origin::Queued },
+                SavedTrack { id: 55391790, info: Some(info), origin: Origin::Queued },
+                SavedTrack { id: 357676035, info: None, origin: Origin::Radio { seed: 55391790 } },
             ],
             shuffle_order: Some(vec![2, 0, 1]),
             active_index: 1,
@@ -177,7 +180,8 @@ mod tests {
         assert_eq!(v["repeat"], "all");
         assert_eq!(v["active_index"], 1);
         assert_eq!(v["shuffle_order"], serde_json::json!([2, 0, 1]));
-        assert_eq!(v["tracks"][0], serde_json::json!({"id": 455128517}), "no metadata, no field");
+        assert_eq!(v["tracks"][0], serde_json::json!({"id": 455128517}), "no metadata, no origin, no field");
+        assert_eq!(v["tracks"][2]["origin"], serde_json::json!({"radio": {"seed": 55391790}}));
         assert_eq!(v["tracks"][1]["info"]["title"], "Time");
         assert_eq!(v["tracks"][1]["info"]["duration"], 413.0);
         assert!(v["tracks"][1]["info"].get("track_mix_id").is_none(), "an unknown radio adds no field");

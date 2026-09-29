@@ -29,6 +29,9 @@ MVP: the core player is complete. What it does today:
 - **Radio:** TIDAL's track and artist radio, from any track's menu, the
   artist page and the now-playing sheet; the station opens as a page to
   play or shuffle.
+- **Continuous playback:** when the queue runs out with repeat off, the
+  last track's radio follows gaplessly, so the music keeps going. It is
+  on by default and can be turned off in Preferences › Playback.
 - **Desktop:** a quality badge (e.g. FLAC 24/192), MPRIS media controls,
   keyboard shortcuts, light and dark styles.
 

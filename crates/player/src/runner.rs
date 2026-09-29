@@ -4,7 +4,8 @@
 //! Engine calls block (each waits for the audio thread's reply, and
 //! `play_url` tears a pipeline down first), so they run in order on one
 //! dedicated thread. TIDAL requests run as tokio tasks. Position is polled
-//! every 250 ms for the just-in-time prefetch.
+//! every 250 ms for the just-in-time prefetch. A radio fetch for
+//! continuous playback is a task too, bounded by `RADIO_TIMEOUT`.
 //!
 //! With a queue file, the queue is saved when it or the current track
 //! changes, on pause and stop, every `SAVE_EVERY` while playing, and when
@@ -18,7 +19,9 @@ use std::time::{Duration, Instant};
 use zeke_engine::audio::AudioPlayer;
 use zeke_engine::events::EngineEvent;
 use zeke_tidal::client_lock::{self, Caller};
+use zeke_tidal::commands::browse;
 use zeke_tidal::commands::playback::resolve_play_uri;
+use zeke_tidal::tidal_api::TidalTrack;
 use zeke_tidal::{AppState, TidalError};
 
 use crate::core::{
@@ -26,11 +29,14 @@ use crate::core::{
     StreamFormat,
 };
 use crate::persist::{Save, Writer};
-use crate::queue::QueueItem;
+use crate::queue::{QueueItem, QueueTrack, TrackInfo};
 
 const TICK: Duration = Duration::from_millis(250);
 /// How often the position is saved while playing.
 const SAVE_EVERY: Duration = Duration::from_secs(10);
+/// A radio fetch that takes longer answers as failed: the player may be
+/// waiting on it with nothing playing.
+const RADIO_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// What the player publishes: its own events, and the engine events it
 /// doesn't consume (signal path, resampling, bit-depth changes) for the UI.
@@ -281,11 +287,67 @@ impl Ctx {
                 };
                 Some(Input::DeviceRates { output, rates })
             }),
+            Effect::FetchRadio { fetch, seed } => {
+                let (state, tx) = (Arc::clone(&self.state), self.input_tx.clone());
+                tokio::spawn(async move {
+                    log::info!("[player] fetching the radio of {} for continuous playback", seed.track_id);
+                    let result = match tokio::time::timeout(RADIO_TIMEOUT, radio(&state, &seed)).await {
+                        Ok(result) => result,
+                        Err(_) => Err(ResolveError {
+                            message: format!("no answer in {} s", RADIO_TIMEOUT.as_secs()),
+                            kind: ErrorKind::Network,
+                        }),
+                    };
+                    match &result {
+                        Ok(tracks) => log::info!("[player] the radio of {} has {} playable tracks", seed.track_id, tracks.len()),
+                        Err(e) => log::info!("[player] the radio of {} failed: {}", seed.track_id, e.message),
+                    }
+                    let _ = tx.send(Input::RadioFetched { fetch, result }).await;
+                });
+            }
             Effect::Emit(event) => {
                 let _ = self.updates.send(Update::Player(event)).await;
             }
         }
     }
+}
+
+/// The playable tracks of `seed`'s track radio, in TIDAL's order, fresh
+/// from TIDAL (each fetch is a new sequence).
+async fn radio(state: &AppState, seed: &QueueItem) -> Result<Vec<QueueTrack>, ResolveError> {
+    let failed = |e: TidalError| ResolveError { message: describe(&e), kind: error_kind(&e) };
+    let mix_id = match seed.info.as_ref().and_then(|i| i.track_mix_id.clone()) {
+        Some(id) => id,
+        None => match browse::track_mix_id(state, seed.track_id).await.map_err(failed)? {
+            Some(id) => id,
+            // Not a failure: a radio with nothing in it.
+            None => {
+                log::info!("[player] track {} has no radio", seed.track_id);
+                return Ok(Vec::new());
+            }
+        },
+    };
+    let mix = browse::mix_fresh(state, &mix_id).await.map_err(failed)?;
+    let total = mix.tracks.len();
+    let tracks: Vec<QueueTrack> = playable(mix.tracks)
+        .iter()
+        .map(|t| QueueTrack {
+            id: t.id,
+            info: serde_json::to_value(t).ok().and_then(|v| TrackInfo::from_json(&v)).map(Arc::new),
+        })
+        .collect();
+    log::info!("[player] radio {mix_id}: {total} tracks, {} playable", tracks.len());
+    Ok(tracks)
+}
+
+/// Leave out what TIDAL marks unplayable, and videos; keep the order.
+fn playable(tracks: Vec<TidalTrack>) -> Vec<TidalTrack> {
+    tracks
+        .into_iter()
+        .filter(|t| {
+            t.stream_ready != Some(false) && t.allow_streaming != Some(false) && t.item_type.as_deref() != Some("video")
+        })
+        .collect()
 }
 
 /// `resolve_play_uri` (quality fallback, DASH → data: URI, ReplayGain choice)
@@ -446,7 +508,28 @@ fn describe(e: &TidalError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::mpd_duration;
+    use super::{mpd_duration, playable};
+    use zeke_tidal::tidal_api::TidalTrack;
+
+    #[test]
+    fn unplayable_radio_tracks_are_left_out_in_order() {
+        let track = |id: u64, flags: serde_json::Value| -> TidalTrack {
+            let mut v = serde_json::json!({"id": id, "title": "T", "duration": 200});
+            v.as_object_mut().unwrap().extend(flags.as_object().unwrap().clone());
+            serde_json::from_value(v).unwrap()
+        };
+        let tracks = vec![
+            track(1, serde_json::json!({"streamReady": true, "allowStreaming": true})),
+            track(2, serde_json::json!({"streamReady": false})),
+            track(3, serde_json::json!({})),
+            track(4, serde_json::json!({"allowStreaming": false, "streamReady": true})),
+            track(5, serde_json::json!({"streamReady": true})),
+            track(6, serde_json::json!({"streamReady": true, "itemType": "video"})),
+            track(7, serde_json::json!({"itemType": "track"})),
+        ];
+        let ids: Vec<u64> = playable(tracks).iter().map(|t| t.id).collect();
+        assert_eq!(ids, vec![1, 3, 5, 7], "unknown flags count as playable");
+    }
 
     #[test]
     fn parses_mpd_durations() {

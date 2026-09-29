@@ -11,5 +11,5 @@ pub use crate::core::{
     unsupported_rate_error, Config, ErrorKind, PlaybackState, PlayerCommand, PlayerEvent, StreamFormat, Transition,
 };
 pub use persist::{PersistedQueue, SavedTrack};
-pub use queue::{QueueItem, QueueTrack, RepeatMode, TrackInfo};
+pub use queue::{Origin, QueueItem, QueueTrack, RepeatMode, TrackInfo};
 pub use runner::{Player, PlayerConfig, Update};

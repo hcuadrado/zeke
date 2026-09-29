@@ -108,6 +108,10 @@ pub struct Settings {
     pub bit_perfect_devices: Vec<String>,
     #[serde(default = "defaults::yes")]
     pub gapless: bool,
+    /// When the queue ends with repeat off, keep playing a radio made from
+    /// its last track.
+    #[serde(default = "defaults::yes")]
+    pub continuous: bool,
     #[serde(default)]
     pub volume_normalization: bool,
     #[serde(default)]
@@ -133,6 +137,7 @@ impl Default for Settings {
             output_device: None,
             bit_perfect_devices: Vec::new(),
             gapless: true,
+            continuous: true,
             volume_normalization: false,
             proxy: Default::default(),
             color_scheme: ColorScheme::System,
@@ -323,6 +328,7 @@ mod settings_tests {
             assert_eq!(s.output_device, None);
             assert!(s.bit_perfect_devices.is_empty());
             assert!(s.gapless);
+            assert!(s.continuous);
             assert_eq!(s.max_quality, "HI_RES_LOSSLESS");
             assert_eq!(s.auth_method, AuthMethod::LoginCode);
             assert_eq!(s.color_scheme, ColorScheme::System);

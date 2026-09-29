@@ -15,8 +15,8 @@ use zeke_engine::events::{self, EngineEvent};
 use zeke_engine::pipeline_probe::PipelineProbe;
 use zeke_engine::{acquire, devices, reserve, SignalPath, SignalPathTracker};
 use zeke_player::{
-    Config, ErrorKind, PersistedQueue, PlaybackState, Player, PlayerCommand, PlayerConfig, PlayerEvent, QueueItem,
-    RepeatMode, StreamFormat, TrackInfo, Transition, Update,
+    Config, ErrorKind, Origin, PersistedQueue, PlaybackState, Player, PlayerCommand, PlayerConfig, PlayerEvent,
+    QueueItem, RepeatMode, StreamFormat, TrackInfo, Transition, Update,
 };
 use zeke_tidal::client_lock::{self, Caller};
 use zeke_tidal::{AppState, ColorScheme, Settings, TidalError};
@@ -70,30 +70,9 @@ impl TrackMeta {
         item.info.as_deref().map(|info| Self::from_info(item.track_id, info))
     }
 
+    /// From a track's detail; the placeholder when it has no title.
     fn from_json(track_id: u64, v: &serde_json::Value) -> Self {
-        let title = match (v["title"].as_str(), v["version"].as_str()) {
-            (Some(t), Some(ver)) if !ver.is_empty() => format!("{t} ({ver})"),
-            (Some(t), _) => t.to_string(),
-            (None, _) => format!("Track {track_id}"),
-        };
-        let artists: Vec<&str> = v["artists"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect())
-            .unwrap_or_default();
-        let artist = if artists.is_empty() {
-            v["artist"]["name"].as_str().unwrap_or("").to_string()
-        } else {
-            artists.join(", ")
-        };
-        Self {
-            track_id,
-            title,
-            artist,
-            album: v["album"]["title"].as_str().unwrap_or("").to_string(),
-            cover: v["album"]["cover"].as_str().map(str::to_string),
-            duration: v["duration"].as_f64(),
-            track_mix_id: zeke_tidal::commands::browse::track_mix(v),
-        }
+        TrackInfo::from_json(v).map_or_else(|| Self::placeholder(track_id), |info| Self::from_info(track_id, &info))
     }
 }
 
@@ -310,6 +289,11 @@ impl Session {
         self.change_settings(move |s| s.gapless = on);
     }
 
+    pub fn set_continuous(&self, on: bool) {
+        self.send(PlayerCommand::SetContinuous(on));
+        self.change_settings(move |s| s.continuous = on);
+    }
+
     pub fn set_normalization(&self, on: bool) {
         self.send(PlayerCommand::SetNormalization(on));
         self.change_settings(move |s| s.volume_normalization = on);
@@ -429,6 +413,7 @@ async fn run(
                 gapless: settings.gapless,
                 normalization: settings.volume_normalization,
                 max_quality: settings.max_quality.clone(),
+                continuous: settings.continuous,
                 ..Config::default()
             },
             seed: None,
@@ -553,6 +538,9 @@ async fn hub(
     let mut current: Option<(u64, Option<f64>)> = None;
     let mut order: (Vec<u64>, usize) = (Vec::new(), 0);
     let mut playing = false;
+    // How the last track started came into the queue: the radio taking
+    // over is worth a word.
+    let mut last_origin: Option<Origin> = None;
     let mut probe_tick = tokio::time::interval(Duration::from_secs(5));
     probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -625,6 +613,10 @@ async fn hub(
                 // track's title (or its trackid for SetPosition).
                 let shown = meta.clone().unwrap_or_else(|| TrackMeta::placeholder(item.track_id));
                 mpris.send(MprisCommand::metadata(&shown, duration));
+                let origin = item.origin;
+                if let Some(text) = radio_takes_over(last_origin.replace(origin), origin, via, &cache) {
+                    let _ = ui.send(UiEvent::Notice(text)).await;
+                }
                 let _ = ui.send(UiEvent::TrackStarted { item, duration, format, meta }).await;
                 wants_tx.send_replace(wish_list(&order, current, &cache, &failed));
                 // The writer has (re)negotiated by then; read the DAC. A
@@ -702,6 +694,16 @@ async fn hub(
                 log::info!("[app] output: {}", device.as_deref().unwrap_or("System Default"));
                 let _ = ui.send(UiEvent::OutputActive(device)).await;
             }
+            Update::Player(PlayerEvent::RadioFetchStarted { seed }) => {
+                log::info!("[app] continuous playback: fetching the radio of {}", seed.track_id);
+            }
+            Update::Player(PlayerEvent::RadioAppended { seed, count }) => {
+                log::info!("[app] continuous playback: {count} tracks of the radio of {} queued", seed.track_id);
+            }
+            Update::Player(PlayerEvent::Notice(text)) => {
+                log::info!("[app] player: {text}");
+                let _ = ui.send(UiEvent::Notice(text)).await;
+            }
             Update::Engine(EngineEvent::SignalPathChanged(p)) => {
                 let _ = ui.send(UiEvent::SignalPath(p)).await;
             }
@@ -709,6 +711,25 @@ async fn hub(
         }
     }
     fetcher.abort();
+}
+
+/// The toast when a radio track follows a queued one on its own (not a
+/// jump the user made, nor a restore, which plays nothing yet).
+fn radio_takes_over(
+    before: Option<Origin>,
+    now: Origin,
+    via: Transition,
+    cache: &HashMap<u64, TrackMeta>,
+) -> Option<String> {
+    let Origin::Radio { seed } = now else { return None };
+    let takes_over = matches!(via, Transition::Gapless | Transition::AfterEnd | Transition::Skip);
+    if before != Some(Origin::Queued) || !takes_over {
+        return None;
+    }
+    Some(match cache.get(&seed) {
+        Some(meta) => format!("Continuing with radio from “{}”", meta.title),
+        None => "Continuing with radio".to_string(),
+    })
 }
 
 /// The tracks whose metadata to fetch, most wanted first: the current one,
@@ -774,26 +795,55 @@ async fn fetch_meta(
 mod tests {
     use super::*;
 
+    /// A page's row, the queue entry it makes, Now Playing's metadata and
+    /// the player's own conversion all read a track the same way.
     #[test]
-    fn metadata_from_tidal_json() {
+    fn one_track_reads_the_same_everywhere() {
         let v = serde_json::json!({
+            "id": 1550546,
             "title": "One More Time",
             "version": "Radio Edit",
             "duration": 320,
-            "artists": [{"name": "Daft Punk"}, {"name": "Romanthony"}],
+            "artists": [{"id": 8847, "name": "Daft Punk"}, {"name": "Romanthony"}],
             "artist": {"name": "Daft Punk"},
-            "album": {"title": "Discovery", "cover": "ab-cd-ef"},
+            "album": {"id": 1550545, "title": "Discovery", "cover": "ab-cd-ef"},
             "mixes": {"TRACK_MIX": "0012ab"},
         });
-        let m = TrackMeta::from_json(1550546, &v);
-        assert_eq!(m.title, "One More Time (Radio Edit)");
-        assert_eq!(m.artist, "Daft Punk, Romanthony");
-        assert_eq!(m.album, "Discovery");
-        assert_eq!(m.duration, Some(320.0));
-        assert_eq!(m.cover.as_deref(), Some("ab-cd-ef"));
-        assert_eq!(m.track_mix_id.as_deref(), Some("0012ab"));
-        let bare = TrackMeta::from_json(7, &serde_json::json!({"artist": {"name": "X"}}));
-        assert_eq!((bare.title.as_str(), bare.artist.as_str()), ("Track 7", "X"));
+        let player = TrackInfo::from_json(&v).unwrap();
+        let row = crate::browse::model::TrackData::from_value(&v).unwrap();
+        let queued = row.queue_track().info.unwrap();
+        assert_eq!(*queued, player);
+        let meta = TrackMeta::from_json(1550546, &v);
+        let shown = (meta.title, meta.artist, meta.album, meta.cover, meta.duration, meta.track_mix_id);
+        let read = (player.title, player.artists, player.album, player.cover, player.duration, player.track_mix_id);
+        assert_eq!(shown, read);
+        assert_eq!(read.0, "One More Time (Radio Edit)");
+        assert_eq!(read.1, "Daft Punk, Romanthony");
+        assert_eq!((row.title.as_str(), row.duration), (read.0.as_str(), Some(320)));
+        assert_eq!(TrackMeta::from_json(7, &serde_json::json!({"artist": {"name": "X"}})).title, "Track 7");
+    }
+
+    #[test]
+    fn the_radio_taking_over_is_announced_once() {
+        let mut cache = HashMap::new();
+        let mut seed = TrackMeta::placeholder(7);
+        seed.title = "Around the World".into();
+        cache.insert(7, seed);
+        let radio = Origin::Radio { seed: 7 };
+        let toast = |before, now, via| radio_takes_over(before, now, via, &cache);
+        assert_eq!(
+            toast(Some(Origin::Queued), radio, Transition::Gapless).as_deref(),
+            Some("Continuing with radio from “Around the World”")
+        );
+        assert_eq!(toast(Some(radio), radio, Transition::Gapless), None, "already on the radio");
+        assert_eq!(toast(None, radio, Transition::Restore), None);
+        assert_eq!(toast(Some(Origin::Queued), radio, Transition::Restore), None);
+        assert_eq!(toast(Some(Origin::Queued), radio, Transition::Jump), None, "the user picked it");
+        assert_eq!(toast(Some(Origin::Queued), Origin::Queued, Transition::AfterEnd), None);
+        assert_eq!(
+            toast(Some(Origin::Queued), Origin::Radio { seed: 8 }, Transition::Skip).as_deref(),
+            Some("Continuing with radio")
+        );
     }
 
     #[test]
