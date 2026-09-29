@@ -70,30 +70,9 @@ impl TrackMeta {
         item.info.as_deref().map(|info| Self::from_info(item.track_id, info))
     }
 
+    /// From a track's detail; the placeholder when it has no title.
     fn from_json(track_id: u64, v: &serde_json::Value) -> Self {
-        let title = match (v["title"].as_str(), v["version"].as_str()) {
-            (Some(t), Some(ver)) if !ver.is_empty() => format!("{t} ({ver})"),
-            (Some(t), _) => t.to_string(),
-            (None, _) => format!("Track {track_id}"),
-        };
-        let artists: Vec<&str> = v["artists"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|x| x["name"].as_str()).collect())
-            .unwrap_or_default();
-        let artist = if artists.is_empty() {
-            v["artist"]["name"].as_str().unwrap_or("").to_string()
-        } else {
-            artists.join(", ")
-        };
-        Self {
-            track_id,
-            title,
-            artist,
-            album: v["album"]["title"].as_str().unwrap_or("").to_string(),
-            cover: v["album"]["cover"].as_str().map(str::to_string),
-            duration: v["duration"].as_f64(),
-            track_mix_id: zeke_tidal::commands::browse::track_mix(v),
-        }
+        TrackInfo::from_json(v).map_or_else(|| Self::placeholder(track_id), |info| Self::from_info(track_id, &info))
     }
 }
 
@@ -774,26 +753,32 @@ async fn fetch_meta(
 mod tests {
     use super::*;
 
+    /// A page's row, the queue entry it makes, Now Playing's metadata and
+    /// the player's own conversion all read a track the same way.
     #[test]
-    fn metadata_from_tidal_json() {
+    fn one_track_reads_the_same_everywhere() {
         let v = serde_json::json!({
+            "id": 1550546,
             "title": "One More Time",
             "version": "Radio Edit",
             "duration": 320,
-            "artists": [{"name": "Daft Punk"}, {"name": "Romanthony"}],
+            "artists": [{"id": 8847, "name": "Daft Punk"}, {"name": "Romanthony"}],
             "artist": {"name": "Daft Punk"},
-            "album": {"title": "Discovery", "cover": "ab-cd-ef"},
+            "album": {"id": 1550545, "title": "Discovery", "cover": "ab-cd-ef"},
             "mixes": {"TRACK_MIX": "0012ab"},
         });
-        let m = TrackMeta::from_json(1550546, &v);
-        assert_eq!(m.title, "One More Time (Radio Edit)");
-        assert_eq!(m.artist, "Daft Punk, Romanthony");
-        assert_eq!(m.album, "Discovery");
-        assert_eq!(m.duration, Some(320.0));
-        assert_eq!(m.cover.as_deref(), Some("ab-cd-ef"));
-        assert_eq!(m.track_mix_id.as_deref(), Some("0012ab"));
-        let bare = TrackMeta::from_json(7, &serde_json::json!({"artist": {"name": "X"}}));
-        assert_eq!((bare.title.as_str(), bare.artist.as_str()), ("Track 7", "X"));
+        let player = TrackInfo::from_json(&v).unwrap();
+        let row = crate::browse::model::TrackData::from_value(&v).unwrap();
+        let queued = row.queue_track().info.unwrap();
+        assert_eq!(*queued, player);
+        let meta = TrackMeta::from_json(1550546, &v);
+        let shown = (meta.title, meta.artist, meta.album, meta.cover, meta.duration, meta.track_mix_id);
+        let read = (player.title, player.artists, player.album, player.cover, player.duration, player.track_mix_id);
+        assert_eq!(shown, read);
+        assert_eq!(read.0, "One More Time (Radio Edit)");
+        assert_eq!(read.1, "Daft Punk, Romanthony");
+        assert_eq!((row.title.as_str(), row.duration), (read.0.as_str(), Some(320)));
+        assert_eq!(TrackMeta::from_json(7, &serde_json::json!({"artist": {"name": "X"}})).title, "Track 7");
     }
 
     #[test]

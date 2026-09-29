@@ -10,8 +10,8 @@ use std::cell::OnceCell;
 use gtk::glib;
 use gtk::subclass::prelude::*;
 use serde_json::Value;
+use zeke_player::queue::artist_names;
 use zeke_player::{QueueTrack, TrackInfo};
-use zeke_tidal::commands::browse::track_mix;
 
 use crate::covers::{self, Kind};
 
@@ -37,6 +37,9 @@ pub struct TrackData {
     pub hires: bool,
     /// The track radio's mix id, when the list item carries it.
     pub track_mix_id: Option<String>,
+    /// What the queue keeps for this track. The fields above that it has
+    /// too are copied from it.
+    pub info: TrackInfo,
 }
 
 fn text(v: &Value) -> Option<&str> {
@@ -102,17 +105,6 @@ fn is_my_tracks(v: &Value) -> bool {
     title_of(v) == "My Tracks" && !truthy(v, "uuid") && !truthy(v, "mixId") && !truthy(v, "cover")
 }
 
-/// Artist names: `artists[]` wins over the singular `artist`.
-fn artist_names(v: &Value) -> String {
-    let names: Vec<&str> =
-        v["artists"].as_array().map(|a| a.iter().filter_map(|x| text(&x["name"])).collect()).unwrap_or_default();
-    if names.is_empty() {
-        text(&v["artist"]["name"]).unwrap_or("").to_string()
-    } else {
-        names.join(", ")
-    }
-}
-
 impl TrackData {
     /// `None` for videos and anything without a numeric id and a title.
     pub fn from_value(v: &Value) -> Option<Self> {
@@ -120,27 +112,24 @@ impl TrackData {
             return None;
         }
         let id = v["id"].as_u64()?;
-        let base = text(&v["title"])?;
-        let title = match text(&v["version"]) {
-            Some(version) => format!("{base} ({version})"),
-            None => base.to_string(),
-        };
+        let info = TrackInfo::from_json(v)?;
         let tags = v["mediaMetadata"]["tags"].as_array();
         let hires = tags.is_some_and(|t| t.iter().any(|x| x == "HIRES_LOSSLESS"))
             || matches!(v["audioQuality"].as_str(), Some("HI_RES_LOSSLESS"));
         Some(Self {
             id,
-            title,
-            artists: artist_names(v),
+            title: info.title.clone(),
+            artists: info.artists.clone(),
             artist_id: v["artists"][0]["id"].as_u64().or_else(|| v["artist"]["id"].as_u64()),
-            album: text(&v["album"]["title"]).unwrap_or("").to_string(),
+            album: info.album.clone(),
             album_id: v["album"]["id"].as_u64(),
-            cover: text(&v["album"]["cover"]).map(str::to_string),
-            duration: v["duration"].as_u64().map(|d| d as u32),
+            cover: info.cover.clone(),
+            duration: info.duration.map(|d| d as u32),
             number: v["trackNumber"].as_u64().map(|n| n as u32),
             explicit: v["explicit"].as_bool().unwrap_or(false),
             hires,
-            track_mix_id: track_mix(v),
+            track_mix_id: info.track_mix_id.clone(),
+            info,
         })
     }
 
@@ -151,17 +140,7 @@ impl TrackData {
 
     /// For the player: the ID with what this page knows.
     pub fn queue_track(&self) -> QueueTrack {
-        QueueTrack::new(
-            self.id,
-            TrackInfo {
-                title: self.title.clone(),
-                artists: self.artists.clone(),
-                album: self.album.clone(),
-                cover: self.cover.clone(),
-                duration: self.duration.map(f64::from),
-                track_mix_id: self.track_mix_id.clone(),
-            },
-        )
+        QueueTrack::new(self.id, self.info.clone())
     }
 
     pub fn cover_url(&self, size: u32) -> Option<String> {
