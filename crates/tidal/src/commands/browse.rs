@@ -116,6 +116,29 @@ pub async fn mix(state: &Arc<AppState>, mix_id: &str) -> Result<MixPageResult, T
     .await
 }
 
+/// A track radio's mix id, from the track's detail (list items often
+/// lack `mixes`). Only a found id is cached: `cached()` would keep a
+/// `None` for a week, and TIDAL may add the radio later.
+pub async fn track_mix_id(state: &AppState, track_id: u64) -> Result<Option<String>, TidalError> {
+    let key = format!("track-mix:{track_id}");
+    if let CacheResult::Fresh(bytes) | CacheResult::Stale(bytes) = state.disk_cache.get(&key, CacheTier::StaticMeta).await {
+        if let Ok(id) = serde_json::from_slice::<String>(&bytes) {
+            return Ok(Some(id));
+        }
+    }
+    let track = client(state, "track mix").await.get_track(track_id).await?;
+    let id = track_mix(&track);
+    if let Some(id) = &id {
+        store(state, &key, id, CacheTier::StaticMeta, &["track-mix"]).await;
+    }
+    Ok(id)
+}
+
+/// `mixes.TRACK_MIX` of a track object.
+pub fn track_mix(track: &Value) -> Option<String> {
+    track["mixes"]["TRACK_MIX"].as_str().filter(|s| !s.is_empty()).map(str::to_string)
+}
+
 pub async fn search(state: &AppState, query: &str, limit: u32) -> Result<TidalSearchResults, TidalError> {
     client(state, "search").await.search(query, limit).await
 }
@@ -393,6 +416,15 @@ fn parse_artist_page_v1(json: &Value) -> ArtistPage {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_tracks_radio_is_its_track_mix() {
+        let track = json!({"id": 1, "mixes": {"TRACK_MIX": "0012ab", "MASTER_TRACK_MIX": "0034cd"}});
+        assert_eq!(track_mix(&track).as_deref(), Some("0012ab"));
+        assert_eq!(track_mix(&json!({"id": 1})), None, "no mixes");
+        assert_eq!(track_mix(&json!({"id": 1, "mixes": {}})), None);
+        assert_eq!(track_mix(&json!({"id": 1, "mixes": {"TRACK_MIX": ""}})), None);
+    }
 
     #[test]
     fn artist_page_v2() {
