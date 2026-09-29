@@ -713,8 +713,8 @@ async fn hub(
     fetcher.abort();
 }
 
-/// The toast when a radio track follows a queued one (not on a restore,
-/// which plays nothing yet).
+/// The toast when a radio track follows a queued one on its own (not a
+/// jump the user made, nor a restore, which plays nothing yet).
 fn radio_takes_over(
     before: Option<Origin>,
     now: Origin,
@@ -722,7 +722,8 @@ fn radio_takes_over(
     cache: &HashMap<u64, TrackMeta>,
 ) -> Option<String> {
     let Origin::Radio { seed } = now else { return None };
-    if before != Some(Origin::Queued) || via == Transition::Restore {
+    let takes_over = matches!(via, Transition::Gapless | Transition::AfterEnd | Transition::Skip);
+    if before != Some(Origin::Queued) || !takes_over {
         return None;
     }
     Some(match cache.get(&seed) {
@@ -837,6 +838,7 @@ mod tests {
         assert_eq!(toast(Some(radio), radio, Transition::Gapless), None, "already on the radio");
         assert_eq!(toast(None, radio, Transition::Restore), None);
         assert_eq!(toast(Some(Origin::Queued), radio, Transition::Restore), None);
+        assert_eq!(toast(Some(Origin::Queued), radio, Transition::Jump), None, "the user picked it");
         assert_eq!(toast(Some(Origin::Queued), Origin::Queued, Transition::AfterEnd), None);
         assert_eq!(
             toast(Some(Origin::Queued), Origin::Radio { seed: 8 }, Transition::Skip).as_deref(),
