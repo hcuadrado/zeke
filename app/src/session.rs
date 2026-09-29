@@ -34,6 +34,8 @@ pub struct TrackMeta {
     /// Image id of the album cover (`resources.tidal.com`).
     pub cover: Option<String>,
     pub duration: Option<f64>,
+    /// The track radio's mix id, when known.
+    pub track_mix_id: Option<String>,
 }
 
 impl TrackMeta {
@@ -46,6 +48,7 @@ impl TrackMeta {
             album: String::new(),
             cover: None,
             duration: None,
+            track_mix_id: None,
         }
     }
 
@@ -58,6 +61,7 @@ impl TrackMeta {
             album: info.album.clone(),
             cover: info.cover.clone(),
             duration: info.duration,
+            track_mix_id: info.track_mix_id.clone(),
         }
     }
 
@@ -88,6 +92,7 @@ impl TrackMeta {
             album: v["album"]["title"].as_str().unwrap_or("").to_string(),
             cover: v["album"]["cover"].as_str().map(str::to_string),
             duration: v["duration"].as_f64(),
+            track_mix_id: zeke_tidal::commands::browse::track_mix(v),
         }
     }
 }
@@ -778,6 +783,7 @@ mod tests {
             "artists": [{"name": "Daft Punk"}, {"name": "Romanthony"}],
             "artist": {"name": "Daft Punk"},
             "album": {"title": "Discovery", "cover": "ab-cd-ef"},
+            "mixes": {"TRACK_MIX": "0012ab"},
         });
         let m = TrackMeta::from_json(1550546, &v);
         assert_eq!(m.title, "One More Time (Radio Edit)");
@@ -785,6 +791,7 @@ mod tests {
         assert_eq!(m.album, "Discovery");
         assert_eq!(m.duration, Some(320.0));
         assert_eq!(m.cover.as_deref(), Some("ab-cd-ef"));
+        assert_eq!(m.track_mix_id.as_deref(), Some("0012ab"));
         let bare = TrackMeta::from_json(7, &serde_json::json!({"artist": {"name": "X"}}));
         assert_eq!((bare.title.as_str(), bare.artist.as_str()), ("Track 7", "X"));
     }
