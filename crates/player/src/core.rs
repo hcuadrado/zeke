@@ -1219,7 +1219,7 @@ fn finite(x: f64) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::queue::TrackInfo;
+    use crate::queue::{Origin, TrackInfo};
 
     fn resolved(tag: &str, duration: f64) -> Resolved {
         resolved_as(tag, duration, 24, 48000)
@@ -2175,9 +2175,9 @@ mod tests {
         let info = |title: &str| TrackInfo { title: title.into(), duration: Some(200.0), ..TrackInfo::default() };
         PersistedQueue {
             tracks: vec![
-                SavedTrack { id: 1, info: Some(info("One")) },
-                SavedTrack { id: 2, info: Some(info("Two")) },
-                SavedTrack { id: 3, info: None },
+                SavedTrack { id: 1, info: Some(info("One")), origin: Origin::Queued },
+                SavedTrack { id: 2, info: Some(info("Two")), origin: Origin::Queued },
+                SavedTrack { id: 3, info: None, origin: Origin::Radio { seed: 2 } },
             ],
             shuffle_order: None,
             active_index: 1,

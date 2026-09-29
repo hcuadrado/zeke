@@ -111,6 +111,23 @@ impl From<&u64> for QueueTrack {
     }
 }
 
+/// How an entry got into the queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Origin {
+    /// The user queued it (a page, Play Next, Add to Queue).
+    #[default]
+    Queued,
+    /// Continuous playback appended it from the radio of track `seed`.
+    Radio { seed: u64 },
+}
+
+impl Origin {
+    pub fn is_queued(&self) -> bool {
+        *self == Origin::Queued
+    }
+}
+
 /// A queue entry. `qid` tells apart two entries of the same track; it
 /// travels through the engine's gapless slot and comes back in
 /// `track-advanced`.
@@ -120,6 +137,7 @@ pub struct QueueItem {
     pub qid: String,
     /// Shared with every copy of the entry (the queue is republished often).
     pub info: Option<Arc<TrackInfo>>,
+    pub origin: Origin,
 }
 
 /// What `Queue::peek_next` predicts after the current track.
@@ -210,11 +228,16 @@ impl Queue {
     }
 
     fn stamp(&mut self, track: QueueTrack) -> QueueItem {
+        self.stamp_as(track, Origin::Queued)
+    }
+
+    fn stamp_as(&mut self, track: QueueTrack, origin: Origin) -> QueueItem {
         self.next_qid += 1;
         QueueItem {
             track_id: track.id,
             qid: format!("{}-{}", track.id, self.next_qid),
             info: track.info,
+            origin,
         }
     }
 
@@ -487,7 +510,11 @@ impl Queue {
     /// off mid-queue, history is still in shuffled order. Each entry keeps
     /// its metadata.
     pub fn to_persisted(&self, position_ms: u64, album_mode: bool) -> crate::persist::PersistedQueue {
-        let saved = |t: &QueueItem| crate::persist::SavedTrack { id: t.track_id, info: t.info.as_deref().cloned() };
+        let saved = |t: &QueueItem| crate::persist::SavedTrack {
+            id: t.track_id,
+            info: t.info.as_deref().cloned(),
+            origin: t.origin,
+        };
         let (tracks, shuffle_order) = if self.shuffle {
             (self.items.iter().map(saved).collect(), Some(self.order.clone()))
         } else {
@@ -511,7 +538,7 @@ impl Queue {
         q.items = p
             .tracks
             .iter()
-            .map(|t| q.stamp(QueueTrack { id: t.id, info: t.info.clone().map(Arc::new) }))
+            .map(|t| q.stamp_as(QueueTrack { id: t.id, info: t.info.clone().map(Arc::new) }, t.origin))
             .collect();
         q.order = match &p.shuffle_order {
             Some(order) => {
@@ -851,7 +878,7 @@ mod tests {
     fn inconsistent_persisted_queues_are_refused() {
         use crate::persist::PersistedQueue;
         let base = PersistedQueue {
-            tracks: [1, 2, 3].map(|id| crate::persist::SavedTrack { id, info: None }).to_vec(),
+            tracks: [1, 2, 3].map(|id| crate::persist::SavedTrack { id, info: None, origin: Origin::Queued }).to_vec(),
             shuffle_order: None,
             active_index: 0,
             position_ms: 0,
