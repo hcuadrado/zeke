@@ -39,6 +39,47 @@ pub struct TrackInfo {
     pub track_mix_id: Option<String>,
 }
 
+impl TrackInfo {
+    /// What a TIDAL track object (a list item or a track's detail) says
+    /// about the track, read the one way the pages, Now Playing and the
+    /// player all show it. `None` without a title.
+    pub fn from_json(v: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            title: display_title(v)?,
+            artists: artist_names(v),
+            album: text(&v["album"]["title"]).unwrap_or("").to_string(),
+            cover: text(&v["album"]["cover"]).map(str::to_string),
+            duration: v["duration"].as_f64().map(f64::round),
+            track_mix_id: zeke_tidal::commands::browse::track_mix(v),
+        })
+    }
+}
+
+fn text(v: &serde_json::Value) -> Option<&str> {
+    v.as_str().filter(|s| !s.is_empty())
+}
+
+/// The title with its version, e.g. "One More Time (Radio Edit)".
+pub fn display_title(v: &serde_json::Value) -> Option<String> {
+    let base = text(&v["title"])?;
+    Some(match text(&v["version"]) {
+        Some(version) => format!("{base} ({version})"),
+        None => base.to_string(),
+    })
+}
+
+/// Artist names, comma-separated: `artists[]` wins over the singular
+/// `artist`.
+pub fn artist_names(v: &serde_json::Value) -> String {
+    let names: Vec<&str> =
+        v["artists"].as_array().map(|a| a.iter().filter_map(|x| text(&x["name"])).collect()).unwrap_or_default();
+    if names.is_empty() {
+        text(&v["artist"]["name"]).unwrap_or("").to_string()
+    } else {
+        names.join(", ")
+    }
+}
+
 /// A track to queue: its ID and, when a page queued it, its metadata. An
 /// ID-only track (e.g. from a saved queue) has `info: None`.
 #[derive(Debug, Clone, PartialEq)]
@@ -745,6 +786,31 @@ mod tests {
             back.in_order().map(|i| i.info.as_ref().map(|i| i.title.clone())).collect();
         assert_eq!(back_titles, titles);
         assert_eq!(back.current().unwrap().info.as_ref().unwrap().duration, Some(200.0));
+    }
+
+    #[test]
+    fn track_info_from_tidal_json() {
+        let v = serde_json::json!({
+            "id": 1550546,
+            "title": "One More Time",
+            "version": "Radio Edit",
+            "duration": 320.4,
+            "artists": [{"name": "Daft Punk"}, {"name": "Romanthony"}],
+            "artist": {"name": "Daft Punk"},
+            "album": {"title": "Discovery", "cover": "ab-cd-ef"},
+            "mixes": {"TRACK_MIX": "0012ab"},
+        });
+        let info = TrackInfo::from_json(&v).unwrap();
+        assert_eq!(info.title, "One More Time (Radio Edit)");
+        assert_eq!(info.artists, "Daft Punk, Romanthony");
+        assert_eq!(info.album, "Discovery");
+        assert_eq!(info.cover.as_deref(), Some("ab-cd-ef"));
+        assert_eq!(info.duration, Some(320.0), "rounded");
+        assert_eq!(info.track_mix_id.as_deref(), Some("0012ab"));
+        let single = serde_json::json!({"title": "T", "version": "", "artist": {"name": "X"}, "album": {"cover": ""}});
+        let info = TrackInfo::from_json(&single).unwrap();
+        assert_eq!((info.title.as_str(), info.artists.as_str(), info.cover, info.duration), ("T", "X", None, None));
+        assert_eq!(TrackInfo::from_json(&serde_json::json!({"title": ""})), None);
     }
 
     #[test]
