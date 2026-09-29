@@ -200,7 +200,7 @@ impl Shell {
 }
 
 /// A detail page's heading: picture, a kind line ("Album"), title,
-/// subtitle, details, and Play / Shuffle.
+/// subtitle, details, and Play / Shuffle (and Radio, where there is one).
 pub struct Heading {
     pub widget: gtk::Box,
     pub picture: gtk::Picture,
@@ -209,6 +209,8 @@ pub struct Heading {
     pub details: gtk::Label,
     pub play: gtk::Button,
     pub shuffle: gtk::Button,
+    /// Hidden until a page that has a radio shows it.
+    pub radio: gtk::Button,
     /// Hidden until the page binds it (`hearts::bind_heart`).
     pub heart: gtk::Button,
 }
@@ -237,10 +239,16 @@ impl Heading {
             .css_classes(["pill"])
             .sensitive(false)
             .build();
+        let radio = gtk::Button::builder()
+            .child(&adw::ButtonContent::builder().icon_name("radio-station-symbolic").label("Radio").build())
+            .css_classes(["pill"])
+            .visible(false)
+            .build();
         let heart = crate::hearts::heart_button();
         let buttons = gtk::Box::builder().spacing(12).margin_top(8).build();
         buttons.append(&play);
         buttons.append(&shuffle);
+        buttons.append(&radio);
         buttons.append(&heart);
         let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).valign(gtk::Align::Center).hexpand(true).build();
         for w in [kind.upcast_ref::<gtk::Widget>(), title.upcast_ref(), subtitle.upcast_ref(), details.upcast_ref(), buttons.upcast_ref()] {
@@ -250,7 +258,7 @@ impl Heading {
         // A picture's natural size is its texture's; the clamp holds it.
         widget.append(&adw::Clamp::builder().maximum_size(200).valign(gtk::Align::Center).child(&picture).build());
         widget.append(&text);
-        Self { widget, picture, title, subtitle, details, play, shuffle, heart }
+        Self { widget, picture, title, subtitle, details, play, shuffle, radio, heart }
     }
 }
 

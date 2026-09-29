@@ -1,5 +1,5 @@
 //! Artist page: picture and name, Play and
-//! Shuffle for the top tracks, then the page's sections: top tracks,
+//! Shuffle for the top tracks, the artist's radio, then the page's sections: top tracks,
 //! albums, EPs and singles, and the rest (playlists, similar artists,
 //! appears on) as card rows. Videos and credits are left out.
 
@@ -71,6 +71,16 @@ fn show(window: &ZekeWindow, shell: &Rc<Shell>, artist: u64, page: &ArtistPage) 
             if let Some(window) = w.upgrade() {
                 let start = if shuffle { None } else { Some(0) };
                 window.play_tracks(&tracks, start, false, Some(shuffle));
+            }
+        });
+    }
+
+    if let Some(id) = page.radio_mix_id.clone() {
+        let (w, title) = (window.downgrade(), format!("{} Radio", page.name));
+        heading.radio.set_visible(true);
+        heading.radio.connect_clicked(move |_| {
+            if let Some(window) = w.upgrade() {
+                window.open(Target::Mix { id: id.clone(), title: Some(title.clone()), kind: Some("Artist Radio") });
             }
         });
     }
