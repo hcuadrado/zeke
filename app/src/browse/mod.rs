@@ -16,12 +16,15 @@ pub mod views;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 use zeke_player::PlayerCommand;
+use zeke_tidal::commands::browse;
 
+use crate::runtime;
 use crate::window::ZekeWindow;
 use model::{CardKind, CardObject, TrackData};
 
@@ -445,6 +448,37 @@ impl ZekeWindow {
     pub fn add_to_queue(&self, track: &TrackData) {
         self.send(PlayerCommand::Append(vec![track.queue_track()]));
         self.toast(&format!("Added “{}” to the queue", track.title));
+    }
+
+    /// Open the track's radio: at once when its mix id is known, else once
+    /// TIDAL has told it. One lookup at a time; activations while one is
+    /// out are ignored.
+    pub fn open_track_radio(&self, track: &TrackData) {
+        let title = format!("{} Radio", track.title);
+        if let Some(id) = &track.track_mix_id {
+            self.open(Target::Mix { id: id.clone(), title: Some(title), kind: Some("Track Radio") });
+            return;
+        }
+        if self.imp().radio_lookup.replace(true) {
+            return;
+        }
+        let state = Arc::clone(&self.session().state);
+        let track_id = track.id;
+        let window = self.downgrade();
+        runtime::spawn(async move { browse::track_mix_id(&state, track_id).await }, move |result| {
+            let Some(window) = window.upgrade() else { return };
+            window.imp().radio_lookup.set(false);
+            match result {
+                Ok(Some(id)) => window.open(Target::Mix { id, title: Some(title), kind: Some("Track Radio") }),
+                Ok(None) => {
+                    log::info!("[browse] track {track_id} has no radio");
+                    window.toast("No radio for this track");
+                }
+                Err(e) => {
+                    window.report("find the track’s radio", &e);
+                }
+            }
+        });
     }
 }
 

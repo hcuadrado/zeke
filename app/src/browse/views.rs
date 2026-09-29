@@ -146,6 +146,9 @@ impl TrackRow {
         let go = gio::Menu::new();
         go.append(Some("Go to Album"), Some("row.go-album"));
         go.append(Some("Go to Artist"), Some("row.go-artist"));
+        // Always enabled: list items often lack the mix id, and
+        // `open_track_radio` looks it up.
+        go.append(Some("Go to Track Radio"), Some("row.radio"));
         menu.append_section(None, &queue);
         menu.append_section(None, &favorite);
         menu.append_section(None, &go);
@@ -193,6 +196,7 @@ impl TrackRow {
                 w.open(Target::Artist(id));
             }
         });
+        action("radio", |w, t| w.open_track_radio(t.data()));
         action("favorite-add", |w, t| w.set_favorite(Favorite::Track(t.data().id), true, &t.data().title));
         action("favorite-remove", |w, t| w.set_favorite(Favorite::Track(t.data().id), false, &t.data().title));
         self.insert_action_group("row", Some(group));

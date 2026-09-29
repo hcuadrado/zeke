@@ -158,6 +158,8 @@ mod imp {
         /// Bumped whenever the queue is replaced: a page still loading the
         /// queue it started appends the rest only while this is unchanged.
         pub queue_generation: Cell<u64>,
+        /// Set while a track radio's mix id is being looked up.
+        pub radio_lookup: Cell<bool>,
         /// The output devices as last listed.
         pub output_devices: RefCell<Vec<zeke_engine::audio::AudioDevice>>,
         /// Set while the devices are being listed.
