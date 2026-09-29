@@ -737,6 +737,11 @@ impl Core {
                     }
                     return;
                 }
+                if mode != RepeatMode::Off {
+                    // Repeat decides what follows now: a radio still on
+                    // the way is never appended.
+                    self.radio = None;
+                }
                 self.maybe_prefetch(fx);
             }
             PlayerCommand::Append(tracks) => {
@@ -2925,6 +2930,18 @@ mod tests {
             let fx = h.answer(fetch, &[10, 11]);
             assert_eq!(appended(&fx), None, "{name}");
             assert_eq!(h.play_order(), before, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_radio_on_the_way_is_dropped_when_repeat_comes_on() {
+        for repeat in [RepeatMode::All, RepeatMode::One] {
+            let mut h = continuous();
+            h.play_at(&[1], 0);
+            let (fetch, _) = fetch_radio(&h.tick(130.0)).unwrap();
+            h.cmd(PlayerCommand::SetRepeat(repeat));
+            assert_eq!(appended(&h.answer(fetch, &[10, 11])), None, "{repeat:?}");
+            assert_eq!(h.play_order(), vec![1]);
         }
     }
 
