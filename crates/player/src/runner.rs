@@ -7,13 +7,18 @@
 //! every 250 ms for the just-in-time prefetch. A radio fetch for
 //! continuous playback is a task too, bounded by `RADIO_TIMEOUT`.
 //!
+//! Every playback command, state change and engine call is logged, and an
+//! engine call still running after `STUCK` is logged while it runs (again at
+//! growing intervals): a stuck call holds up every call behind it, and the
+//! player looks frozen. So is an engine thread that ended.
+//!
 //! With a queue file, the queue is saved when it or the current track
 //! changes, on pause and stop, every `SAVE_EVERY` while playing, and when
 //! the player shuts down. Saves are written on their own thread.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use zeke_engine::audio::AudioPlayer;
@@ -37,6 +42,10 @@ const SAVE_EVERY: Duration = Duration::from_secs(10);
 /// A radio fetch that takes longer answers as failed: the player may be
 /// waiting on it with nothing playing.
 const RADIO_TIMEOUT: Duration = Duration::from_secs(20);
+/// An engine call running this long is logged as stuck.
+const STUCK: Duration = Duration::from_secs(5);
+/// An engine call that took this long is logged when it returns.
+const SLOW: Duration = Duration::from_secs(1);
 
 /// What the player publishes: its own events, and the engine events it
 /// doesn't consume (signal path, resampling, bit-depth changes) for the UI.
@@ -84,7 +93,16 @@ impl Player {
     }
 }
 
-type EngineJob = Box<dyn FnOnce(&AudioPlayer) -> Option<Input> + Send>;
+type EngineJob = (&'static str, Box<dyn FnOnce(&AudioPlayer) -> Option<Input> + Send>);
+
+/// What the engine thread is doing, for the stuck-call log.
+#[derive(Default)]
+struct EngineBusy {
+    /// The running call and when it started.
+    running: Mutex<Option<(&'static str, Instant)>>,
+    /// Calls sent and not started yet.
+    waiting: AtomicUsize,
+}
 
 async fn run(
     state: Arc<AppState>,
@@ -106,20 +124,38 @@ async fn run(
 
     // The engine thread: runs jobs in order, posts their results as inputs.
     let (job_tx, job_rx) = mpsc::channel::<EngineJob>();
+    let busy = Arc::new(EngineBusy::default());
     let engine_thread = {
         let engine = Arc::clone(&engine);
         let input_tx = input_tx.clone();
+        let busy = Arc::clone(&busy);
         std::thread::Builder::new()
             .name("player-engine".into())
             .spawn(move || {
-                for job in job_rx {
-                    if let Some(input) = job(&engine) {
+                for (what, job) in job_rx {
+                    busy.waiting.fetch_sub(1, Ordering::AcqRel);
+                    // Not the 250 ms position poll, nor a volume drag.
+                    if !matches!(what, "position" | "set_volume") {
+                        log::info!("[player] engine {what}");
+                    }
+                    let started = Instant::now();
+                    *busy.running.lock().unwrap_or_else(|p| p.into_inner()) = Some((what, started));
+                    let input = job(&engine);
+                    *busy.running.lock().unwrap_or_else(|p| p.into_inner()) = None;
+                    let took = started.elapsed();
+                    if took >= SLOW {
+                        log::warn!("[player] engine {what} took {:.1} s", took.as_secs_f64());
+                    }
+                    if let Some(input) = input {
                         let _ = input_tx.send_blocking(input);
                     }
                 }
             })
             .expect("spawn player-engine thread")
     };
+    // The call logged as stuck (by its start) and when to log it again.
+    let mut stuck: Option<(Instant, Duration)> = None;
+    let mut engine_gone_logged = false;
     let tick_pending = Arc::new(AtomicBool::new(false));
     let mut tick = tokio::time::interval(TICK);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -128,13 +164,19 @@ async fn run(
         state,
         input_tx,
         job_tx,
+        busy: Arc::clone(&busy),
         updates: updates.clone(),
     };
 
     loop {
         let input = tokio::select! {
             c = commands.recv() => match c {
-                Ok(c) => Input::Command(c),
+                Ok(c) => {
+                    if let Some(what) = transport(&c) {
+                        log::info!("[player] command: {what}");
+                    }
+                    Input::Command(c)
+                }
                 Err(_) => break, // closed: shut down
             },
             ev = engine_events.recv() => match ev {
@@ -164,6 +206,31 @@ async fn run(
                 Err(_) => break,
             },
             _ = tick.tick() => {
+                let running = *busy.running.lock().unwrap_or_else(|p| p.into_inner());
+                if engine_thread.is_finished() {
+                    // A panic in a call ends the thread with `running` still set.
+                    if !engine_gone_logged {
+                        engine_gone_logged = true;
+                        log::error!(
+                            "[player] the engine thread ended{}; no engine call runs any more",
+                            running.map(|(what, _)| format!(" in {what}")).unwrap_or_default(),
+                        );
+                    }
+                } else if let Some((what, since)) = running {
+                    let next = match stuck {
+                        Some((call, next)) if call == since => next,
+                        _ => STUCK,
+                    };
+                    if since.elapsed() >= next {
+                        // 5 s, 20 s, 80 s, 320 s, then every 5 min.
+                        stuck = Some((since, (next * 4).min(next + Duration::from_secs(300))));
+                        log::warn!(
+                            "[player] engine {what} has been running for {:.0} s; {} engine calls wait behind it",
+                            since.elapsed().as_secs_f64(),
+                            busy.waiting.load(Ordering::Acquire),
+                        );
+                    }
+                }
                 if let Some(saver) = &mut saver {
                     saver.periodic(&core);
                 }
@@ -172,7 +239,7 @@ async fn run(
                 {
                     let pending = Arc::clone(&tick_pending);
                     let track = core.track_seq();
-                    ctx.engine(move |e| {
+                    ctx.engine("position", move |e| {
                         pending.store(false, Ordering::Release);
                         e.get_position().ok().map(|p| Input::Tick { position: f64::from(p), track })
                     });
@@ -181,8 +248,12 @@ async fn run(
             }
         };
         let now = started.elapsed().as_secs_f64();
+        let before = core.state();
         for effect in core.handle(input, now) {
             ctx.apply(effect).await;
+        }
+        if core.state() != before {
+            log::info!("[player] state: {before:?} -> {:?}", core.state());
         }
         if let Some(saver) = &mut saver {
             saver.after_input(&core);
@@ -197,14 +268,18 @@ async fn run(
     }
 
     // Release the device.
-    let _ = ctx.job_tx.send(Box::new(|e: &AudioPlayer| {
-        if let Err(err) = e.stop() {
-            log::warn!("[player] engine stop: {err}");
-        }
-        None
-    }));
+    ctx.engine_call("stop", |e| e.stop());
     drop(ctx);
-    let _ = tokio::task::spawn_blocking(move || engine_thread.join()).await;
+    let mut joined = tokio::task::spawn_blocking(move || engine_thread.join());
+    if tokio::time::timeout(STUCK, &mut joined).await.is_err() {
+        let running = *busy.running.lock().unwrap_or_else(|p| p.into_inner());
+        log::warn!(
+            "[player] shutdown waits for the engine: {} running, {} calls behind it",
+            running.map_or("nothing", |(what, _)| what),
+            busy.waiting.load(Ordering::Acquire),
+        );
+        let _ = joined.await;
+    }
     log::info!("[player] stopped");
 }
 
@@ -212,17 +287,21 @@ struct Ctx {
     state: Arc<AppState>,
     input_tx: async_channel::Sender<Input>,
     job_tx: mpsc::Sender<EngineJob>,
+    busy: Arc<EngineBusy>,
     updates: async_channel::Sender<Update>,
 }
 
 impl Ctx {
-    fn engine(&self, job: impl FnOnce(&AudioPlayer) -> Option<Input> + Send + 'static) {
-        let _ = self.job_tx.send(Box::new(job));
+    fn engine(&self, what: &'static str, job: impl FnOnce(&AudioPlayer) -> Option<Input> + Send + 'static) {
+        self.busy.waiting.fetch_add(1, Ordering::AcqRel);
+        if self.job_tx.send((what, Box::new(job))).is_err() {
+            self.busy.waiting.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     /// An engine call whose only outcome worth knowing is a failure.
     fn engine_call(&self, what: &'static str, call: impl FnOnce(&AudioPlayer) -> Result<(), String> + Send + 'static) {
-        self.engine(move |e| {
+        self.engine(what, move |e| {
             if let Err(err) = call(e) {
                 log::warn!("[player] engine {what}: {err}");
             }
@@ -246,7 +325,7 @@ impl Ctx {
                     let _ = tx.send(Input::NextResolved { prefetch, result }).await;
                 });
             }
-            Effect::Play { load, uri, norm_gain, start } => self.engine(move |e| {
+            Effect::Play { load, uri, norm_gain, start } => self.engine("play", move |e| {
                 // Gain before play_url, so the pipeline starts at the right
                 // level.
                 let result = e
@@ -267,7 +346,7 @@ impl Ctx {
             Effect::SetNormGain(g) => self.engine_call("set_normalization_gain", move |e| e.set_normalization_gain(g)),
             Effect::SetVolume(v) => self.engine_call("set_volume", move |e| e.set_volume(v)),
             Effect::SetGapless(on) => self.engine_call("set_gapless", move |e| e.set_gapless(on)),
-            Effect::ConfigureOutput { output, exclusive, device, bit_perfect } => self.engine(move |e| {
+            Effect::ConfigureOutput { output, exclusive, device, bit_perfect } => self.engine("configure output", move |e| {
                 log::info!(
                     "[player] output: exclusive={exclusive} bit_perfect={bit_perfect} device={}",
                     device.as_deref().unwrap_or("-")
@@ -310,6 +389,23 @@ impl Ctx {
             }
         }
     }
+}
+
+/// A playback command, for the log; `None` for settings and queue edits.
+fn transport(c: &PlayerCommand) -> Option<String> {
+    Some(match c {
+        PlayerCommand::Load { tracks, start, .. } => format!("load {} tracks at {start:?}", tracks.len()),
+        PlayerCommand::Pause => "pause".into(),
+        PlayerCommand::Resume => "resume".into(),
+        PlayerCommand::TogglePause => "play/pause".into(),
+        PlayerCommand::Next => "next".into(),
+        PlayerCommand::Previous => "previous".into(),
+        PlayerCommand::Seek(t) => format!("seek to {t:.1} s"),
+        PlayerCommand::SeekBy(d) => format!("seek by {d:.1} s"),
+        PlayerCommand::Stop => "stop".into(),
+        PlayerCommand::JumpTo(_) => "jump to a queue entry".into(),
+        _ => return None,
+    })
 }
 
 /// The playable tracks of `seed`'s track radio, in TIDAL's order, fresh
