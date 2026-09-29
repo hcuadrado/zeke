@@ -124,6 +124,8 @@ mod imp {
         pub bar_heart: TemplateChild<gtk::Button>,
         #[template_child]
         pub sheet_heart: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub sheet_radio: TemplateChild<gtk::Button>,
 
         pub session: OnceCell<Rc<Session>>,
         pub plugins: OnceCell<Rc<crate::plugins::Host>>,
@@ -435,6 +437,11 @@ impl ZekeWindow {
     #[template_callback]
     fn on_close_sheet(&self) {
         self.imp().sheet.set_open(false);
+    }
+
+    #[template_callback]
+    fn on_sheet_radio(&self) {
+        self.open_playing_radio();
     }
 
     #[template_callback]
