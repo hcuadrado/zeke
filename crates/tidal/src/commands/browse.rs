@@ -116,6 +116,16 @@ pub async fn mix(state: &Arc<AppState>, mix_id: &str) -> Result<MixPageResult, T
     .await
 }
 
+/// A mix fetched from TIDAL, never from the cache: each fetch of a radio
+/// returns a new sequence, and a cached one would offer the same tracks
+/// every time. Stored under `mix()`'s key, so a page opened afterwards
+/// shows the same station.
+pub async fn mix_fresh(state: &AppState, mix_id: &str) -> Result<MixPageResult, TidalError> {
+    let mix = client(state, "radio").await.get_mix_items(mix_id).await?;
+    store(state, &format!("mix-page:{mix_id}"), &mix, CacheTier::Dynamic, &["mix-page"]).await;
+    Ok(mix)
+}
+
 /// A track radio's mix id, from the track's detail (list items often
 /// lack `mixes`). Only a found id is cached: `cached()` would keep a
 /// `None` for a week, and TIDAL may add the radio later.
