@@ -26,6 +26,9 @@ MVP: the core player is complete. What it does today:
 - **Queue:** shuffle, repeat and seek; a now-playing sheet; the queue is
   saved across restarts. Long playlists start playing before they have
   fully loaded.
+- **Radio:** TIDAL's track and artist radio, from any track's menu, the
+  artist page and the now-playing sheet; the station opens as a page to
+  play or shuffle.
 - **Desktop:** a quality badge (e.g. FLAC 24/192), MPRIS media controls,
   keyboard shortcuts, light and dark styles.
 
