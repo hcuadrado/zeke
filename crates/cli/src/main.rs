@@ -702,6 +702,13 @@ async fn play_queue(state: Arc<AppState>, mut q: QueueOptions, opts: PlayOptions
                         "[player] {} is busy: playing on the system default",
                         device.as_deref().unwrap_or("the default exclusive device")
                     ),
+                    PlayerEvent::RadioFetchStarted { seed } => {
+                        log::info!("[player] continuous: fetching the radio of {} ({})", seed.track_id, seed.qid)
+                    }
+                    PlayerEvent::RadioAppended { seed, count } => {
+                        log::info!("[player] continuous: {count} tracks of the radio of {} appended", seed.track_id)
+                    }
+                    PlayerEvent::Notice(text) => log::info!("[player] notice: {text}"),
                     PlayerEvent::OutputActive { exclusive, device } => log::info!(
                         "[player] output: {}",
                         match (exclusive, device.as_deref()) {

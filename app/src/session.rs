@@ -681,6 +681,16 @@ async fn hub(
                 log::info!("[app] output: {}", device.as_deref().unwrap_or("System Default"));
                 let _ = ui.send(UiEvent::OutputActive(device)).await;
             }
+            Update::Player(PlayerEvent::RadioFetchStarted { seed }) => {
+                log::info!("[app] continuous playback: fetching the radio of {}", seed.track_id);
+            }
+            Update::Player(PlayerEvent::RadioAppended { seed, count }) => {
+                log::info!("[app] continuous playback: {count} tracks of the radio of {} queued", seed.track_id);
+            }
+            Update::Player(PlayerEvent::Notice(text)) => {
+                log::info!("[app] player: {text}");
+                let _ = ui.send(UiEvent::Notice(text)).await;
+            }
             Update::Engine(EngineEvent::SignalPathChanged(p)) => {
                 let _ = ui.send(UiEvent::SignalPath(p)).await;
             }
