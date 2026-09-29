@@ -168,6 +168,12 @@ pub fn config_dir() -> PathBuf {
     dir
 }
 
+/// `~/.local/state/zeke/zeke.log`: the app's log, with the previous runs'
+/// next to it (`logger::also_to_file`).
+pub fn log_file() -> PathBuf {
+    dirs::state_dir().map_or_else(config_dir, |d| d.join("zeke")).join("zeke.log")
+}
+
 /// Write through a temporary file and a rename, so a crash mid-write never
 /// leaves a truncated (unreadable, hence logged-out) settings file.
 fn write_atomic(path: &Path, data: &[u8]) -> std::io::Result<()> {
