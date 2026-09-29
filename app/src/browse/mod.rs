@@ -68,7 +68,10 @@ impl Root {
 pub enum Target {
     Album(u64),
     Playlist(String),
-    Mix(String),
+    /// A mix, or a radio station (TIDAL serves those as mixes). `kind`
+    /// labels the page ("Mix" when `None`); `title` stands in until the
+    /// mix brings its own.
+    Mix { id: String, title: Option<String>, kind: Option<&'static str> },
     Artist(u64),
     /// A Home section's "view all" (`get_page_section`).
     ViewAll { title: String, api_path: String },
@@ -368,7 +371,7 @@ impl ZekeWindow {
         let page: BrowsePage = match target {
             Target::Album(id) => detail::album(self, id),
             Target::Playlist(uuid) => detail::playlist(self, uuid),
-            Target::Mix(id) => detail::mix(self, id),
+            Target::Mix { id, title, kind } => detail::mix(self, id, title, kind),
             Target::Artist(id) => artist::page(self, id),
             Target::ViewAll { title, api_path } => home::view_all(self, title, api_path),
             Target::ArtistViewAll { title, artist, path, tracks } => artist::view_all(self, title, artist, path, tracks),
@@ -382,7 +385,7 @@ impl ZekeWindow {
         match &card.data().kind {
             CardKind::Album(id) => self.open(Target::Album(*id)),
             CardKind::Playlist(uuid) => self.open(Target::Playlist(uuid.clone())),
-            CardKind::Mix(id) => self.open(Target::Mix(id.clone())),
+            CardKind::Mix(id) => self.open(Target::Mix { id: id.clone(), title: None, kind: None }),
             CardKind::Artist(id) => self.open(Target::Artist(*id)),
             CardKind::MyTracks => self.show_root(Root::FavoriteTracks),
             CardKind::Track(_) => {
