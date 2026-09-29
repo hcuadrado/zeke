@@ -457,6 +457,57 @@ impl Drop for WriterSlot {
     }
 }
 
+/// Zeke: a DirectAlsa seek in flight. While open, the appsink callback drops
+/// what it gets instead of sending it: that audio was decoded before the
+/// seek's flush reached the sink, at the old position. The flush arriving at
+/// the appsink closes it (`flush_stopped`), which is the exact moment: every
+/// buffer after it is post-seek. A seek that sent no flush (it failed) is
+/// closed by its caller.
+///
+/// The writer is unpaused for the seek, only to drain its channel and so free
+/// a callback blocked on it; the gate pauses it again when it closes, before
+/// any post-seek audio can reach it.
+struct SeekGate {
+    open: AtomicBool,
+    /// Pause the writer again on close: the seek was issued while paused.
+    repause: AtomicBool,
+    paused: Arc<AtomicBool>,
+}
+
+impl SeekGate {
+    fn new(paused: Arc<AtomicBool>) -> Self {
+        Self { open: AtomicBool::new(false), repause: AtomicBool::new(false), paused }
+    }
+
+    /// Before the generation bump: a callback that reads the new generation
+    /// (Acquire) then sees the gate open.
+    fn open(&self) {
+        self.repause.store(self.paused.load(Ordering::Acquire), Ordering::Release);
+        self.open.store(true, Ordering::Release);
+        self.paused.store(false, Ordering::Release);
+    }
+
+    fn is_open(&self) -> bool {
+        self.open.load(Ordering::Acquire)
+    }
+
+    /// A seek abandoned before it bumped the generation: back as it was.
+    fn cancel(&self) {
+        if self.repause.swap(false, Ordering::AcqRel) {
+            self.paused.store(true, Ordering::Release);
+        }
+        self.open.store(false, Ordering::Release);
+    }
+
+    /// FLUSH_STOP reached the appsink, or the seek returned; the first of the
+    /// two closes the gate. The writer is paused again before it opens up.
+    fn close(&self) {
+        if self.is_open() {
+            self.cancel();
+        }
+    }
+}
+
 /// Active playback backend — determines command dispatch.
 /// The ALSA writer lives in a [`WriterSlot`] so it persists across PlayUrl
 /// calls.
@@ -1604,6 +1655,7 @@ fn spawn_alsa_writer(
                     pcm.prepare().ok();
                     true
                 } else if errno == libc::ESTRPIPE {
+                    log::warn!("[alsa-writer] the device was suspended, resuming it");
                     let mut recovered = false;
                     loop {
                         match pcm.resume() {
@@ -1789,6 +1841,12 @@ fn spawn_alsa_writer(
                             let can_hw = pcm.state() == alsa::pcm::State::Running
                                 && pcm.hw_params_current().map(|p| p.can_pause()).unwrap_or(false);
                             if can_hw { pcm.pause(true).ok(); }
+                            let paused_at = std::time::Instant::now();
+                            log::info!(
+                                "[alsa-writer] paused ({}), pcm {:?}",
+                                if can_hw { "hw pause" } else { "writing silence" },
+                                pcm.state()
+                            );
 
                             while paused.load(Ordering::Acquire) {
                                 if stop.load(Ordering::Acquire) {
@@ -1812,12 +1870,36 @@ fn spawn_alsa_writer(
                                 }
                             }
 
-                            if can_hw {
-                                pcm.pause(false).ok();
+                            // Zeke: Stop sets `stop` and then clears `paused`;
+                            // a writer asleep in the loop wakes to the latter.
+                            // Leave without un-pausing the DAC, which would
+                            // play what it holds.
+                            if stop.load(Ordering::Acquire) {
+                                log::debug!("[alsa-writer] shutdown while paused");
+                                pcm.drop().ok();
+                                break 'main;
+                            }
+
+                            // Logged: a writer that resumes into a bad pcm
+                            // state can block in writei with every later
+                            // engine call behind it.
+                            let unpaused = if can_hw {
+                                pcm.pause(false)
                             } else {
                                 // Clear silence from ring buffer after software pause
                                 pcm.drop().ok();
-                                pcm.prepare().ok();
+                                pcm.prepare()
+                            };
+                            let state = pcm.state();
+                            match unpaused {
+                                Ok(()) => log::info!(
+                                    "[alsa-writer] resumed after {:.0} s, pcm {state:?}",
+                                    paused_at.elapsed().as_secs_f64()
+                                ),
+                                Err(e) => log::warn!(
+                                    "[alsa-writer] resumed after {:.0} s, but un-pausing failed: {e}; pcm {state:?}",
+                                    paused_at.elapsed().as_secs_f64()
+                                ),
                             }
 
                             // Re-check generation — may have changed during pause (track change)
@@ -2350,6 +2432,8 @@ impl AudioPlayer {
             let current_sample_rate = Arc::new(AtomicU32::new(48000));
             let writer_gen = Arc::new(AtomicU64::new(0));
             let paused = Arc::new(AtomicBool::new(false));
+            // Zeke: a DirectAlsa seek in flight; see `SeekGate`.
+            let seek_gate = Arc::new(SeekGate::new(Arc::clone(&paused)));
             let combined_vol = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
             let user_amp = Arc::new(AtomicU32::new(1.0_f32.to_bits()));
             // Zeke: the norm gain the listener hears now. On DirectAlsa the
@@ -2669,6 +2753,7 @@ impl AudioPlayer {
                                         bit_perfect,
                                         wtx.clone(),
                                         Arc::clone(&writer_gen),
+                                        Arc::clone(&seek_gate),
                                         fmt_for_pipeline,
                                         supported_fmts_for_pipeline,
                                         supported_rates_for_pipeline,
@@ -2904,6 +2989,12 @@ impl AudioPlayer {
                                 if let Ok(sink_bin) = sink.clone().dynamic_cast::<gst::Bin>() {
                                     let output_cell = Arc::clone(&output_cell_thread);
                                     sink_bin.connect_element_added(move |_bin, element| {
+                                        // Not the fakesink autoaudiosink puts back
+                                        // when it shuts down.
+                                        let factory = element.factory().map_or("-".into(), |f| f.name().to_string());
+                                        if factory != "fakesink" {
+                                            log::info!("[audio] output sink: {factory}");
+                                        }
                                         let cell = Arc::clone(&output_cell);
                                         if let Some(sink_pad) = element.static_pad("sink") {
                                             sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
@@ -3114,7 +3205,7 @@ impl AudioPlayer {
                                         let writer_gen = Arc::clone(&writer_gen);
                                         let frames_written = Arc::clone(&frames_written);
                                         let sample_rate = Arc::clone(&current_sample_rate);
-                                        let paused = Arc::clone(&paused);
+                                        let seek_gate = Arc::clone(&seek_gate);
                                         let writer_tx = writer.tx.clone();
                                         std::thread::spawn(move || {
                                             let (ret, cur, pend) =
@@ -3126,16 +3217,20 @@ impl AudioPlayer {
                                             // backwards: if a newer track claimed the
                                             // writer while this one prerolled, it owns
                                             // the position and the seek is abandoned.
-                                            if writer_gen.fetch_max(resume_gen, Ordering::AcqRel)
-                                                > resume_gen
-                                            {
+                                            if writer_gen.load(Ordering::Acquire) > resume_gen {
                                                 return;
                                             }
                                             // `frames_written` is the only position
                                             // this backend reports, and the writer
                                             // has to be unblocked to take the Flush.
-                                            let was_paused = paused.load(Ordering::Acquire);
-                                            paused.store(false, Ordering::Release);
+                                            // Zeke: opened before the bump, as in `Seek`.
+                                            seek_gate.open();
+                                            if writer_gen.fetch_max(resume_gen, Ordering::AcqRel)
+                                                > resume_gen
+                                            {
+                                                seek_gate.cancel();
+                                                return;
+                                            }
                                             if let Some(ref tx) = writer_tx {
                                                 let _ = tx.send(WriterCommand::Flush);
                                             }
@@ -3154,9 +3249,7 @@ impl AudioPlayer {
                                                     "[audio] resume at {position_secs}s failed: {e}"
                                                 );
                                             }
-                                            if was_paused {
-                                                paused.store(true, Ordering::Release);
-                                            }
+                                            seek_gate.close();
                                         });
                                     }
                                     None => {}
@@ -3179,12 +3272,20 @@ impl AudioPlayer {
                                 .set_state(gst::State::Paused)
                                 .map(|_| ())
                                 .map_err(|e| format!("Failed to pause: {e}")),
-                            Some(PlaybackBackend::DirectAlsa { pipeline, .. }) => {
+                            Some(PlaybackBackend::DirectAlsa { .. }) => {
+                                // Zeke: only the writer pauses; the decode
+                                // pipeline stays PLAYING and blocks on the full
+                                // writer channel until resume. Pausing it too
+                                // deadlocked: the paused writer stops reading,
+                                // the appsink callback blocks in `send` holding
+                                // the sink's preroll lock, and PLAYING→PAUSED
+                                // waits for that lock. The appsink doesn't sync
+                                // to the clock and the position is the writer's
+                                // frame count, so nothing else notices. Seek,
+                                // PlayUrl and Stop clear `paused` first, which
+                                // lets the writer drain and the callback return.
                                 paused.store(true, Ordering::Release);
-                                pipeline
-                                    .set_state(gst::State::Paused)
-                                    .map(|_| ())
-                                    .map_err(|e| format!("Failed to pause decode: {e}"))
+                                Ok(())
                             }
                             None => Err("No active pipeline".into()),
                         };
@@ -3239,7 +3340,11 @@ impl AudioPlayer {
                             }
                             Some(PlaybackBackend::DirectAlsa { pipeline, .. }) => {
                                 // Bump generation so writer discards stale data,
-                                // then unblock and shut down
+                                // then unblock and shut down. Zeke: `stop` before
+                                // `paused` clears, so a paused writer leaves its
+                                // pause loop for Shutdown instead of writing
+                                // what is queued first.
+                                writer.stop.store(true, Ordering::Release);
                                 paused.store(false, Ordering::Release);
                                 pipeline_epoch.fetch_add(1, Ordering::AcqRel);
                                 track_generation += 1;
@@ -3329,8 +3434,9 @@ impl AudioPlayer {
                                     .map_err(|e| format!("Seek failed: {e}"))
                             }
                             Some(PlaybackBackend::DirectAlsa { pipeline, .. }) => {
-                                let was_paused = paused.load(Ordering::Acquire);
-                                paused.store(false, Ordering::Release);
+                                // Zeke: nothing decoded before the flush reaches
+                                // the writer; see `SeekGate`.
+                                seek_gate.open();
                                 track_generation += 1;
                                 writer_gen.store(track_generation, Ordering::Release);
                                 if let Some(ref tx) = writer.tx {
@@ -3352,9 +3458,7 @@ impl AudioPlayer {
                                         pos,
                                     )
                                     .map_err(|e| format!("Seek failed: {e}"));
-                                if was_paused {
-                                    paused.store(true, Ordering::Release);
-                                }
+                                seek_gate.close();
                                 result
                             }
                             None => Err("No active pipeline".into()),
@@ -4020,6 +4124,8 @@ fn build_appsink_pipeline(
     bit_perfect: bool,
     writer_tx: crossbeam_channel::Sender<WriterCommand>,
     writer_gen: Arc<AtomicU64>,
+    // Zeke: while open, decoded audio is dropped here instead of sent.
+    seek_gate: Arc<SeekGate>,
     // The ALSA writer's negotiated device format. Its channel count drives the
     // stereo→Nch upmix (mix-matrix) and the capsfilter / appsink channel pin
     // when the DAC exposes only a fixed channel count (> 2).
@@ -4369,8 +4475,13 @@ fn build_appsink_pipeline(
     let probe_tx = writer_tx.clone();
     if let Some(sink_pad) = appsink.static_pad("sink") {
         let output_cell_for_probe = Arc::clone(&output_cell);
-        sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+        let flush_gate = Arc::clone(&seek_gate);
+        // Zeke: flush events reach only probes that ask for them (EVENT_FLUSH).
+        sink_pad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM | gst::PadProbeType::EVENT_FLUSH, move |_pad, info| {
             if let Some(gst::PadProbeData::Event(ref event)) = info.data {
+                if let gst::EventView::FlushStop(_) = event.view() {
+                    flush_gate.close();
+                }
                 if let gst::EventView::Caps(caps_event) = event.view() {
                     let caps = caps_event.caps();
                     if let Some(fmt) = parse_pcm_format(caps) {
@@ -4400,9 +4511,17 @@ fn build_appsink_pipeline(
                 let caps = sample.caps().ok_or(gst::FlowError::Error)?;
                 let format = parse_pcm_format(caps).ok_or(gst::FlowError::Error)?;
 
+                // Zeke: the generation first, then the gate. A seek opens the
+                // gate before it bumps the generation, so a chunk stamped with
+                // the new generation always sees it open and is dropped: it was
+                // decoded before the flush reached this sink, at the old
+                // position, and would otherwise be written as post-seek audio.
+                let generation = chunk_gen.load(Ordering::Acquire);
+                if seek_gate.is_open() {
+                    return Ok(gst::FlowSuccess::Ok);
+                }
                 let map = buffer.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let data = map.as_slice().to_vec();
-                let generation = chunk_gen.load(Ordering::Acquire);
 
                 writer_tx
                     .send(WriterCommand::Data(AudioChunk {
