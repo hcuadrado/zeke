@@ -57,6 +57,10 @@ fn main() -> glib::ExitCode {
         #[strong]
         session,
         move |app| {
+            // Here, not in main: only the primary instance gets here, and a
+            // second launch would rotate the running one's log away.
+            zeke_tidal::logger::also_to_file(&zeke_tidal::log_file());
+            log::info!("[app] Zeke {} starting", env!("CARGO_PKG_VERSION"));
             gtk::Window::set_default_icon_name(APP_ID);
             app.style_manager().set_color_scheme(adw_scheme(settings.color_scheme));
             setup_actions(app, settings.color_scheme, Rc::clone(&session));
