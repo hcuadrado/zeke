@@ -205,20 +205,18 @@ impl ZekeWindow {
         imp.sheet_radio.set_sensitive(true);
     }
 
-    /// The sheet's Radio button: the playing track's radio, on a page
-    /// the sheet closes to show.
+    /// The sheet's Radio button: the playing track's radio. The sheet
+    /// closes only when the page opens; a toast shows over it.
     pub fn open_playing_radio(&self) {
         let imp = self.imp();
         let Some(id) = imp.now.borrow().as_ref().map(|n| n.track_id) else { return };
         let meta = imp.metas.borrow().get(&id).cloned();
         let track = crate::browse::model::TrackData {
             id,
-            title: meta.as_ref().map_or_else(|| format!("Track {id}"), |m| m.title.clone()),
+            title: meta.as_ref().map(|m| m.title.clone()).unwrap_or_default(),
             track_mix_id: meta.and_then(|m| m.track_mix_id),
             ..Default::default()
         };
-        imp.sheet.set_open(false);
-        imp.split_view.set_show_content(true);
         self.open_track_radio(&track);
     }
 

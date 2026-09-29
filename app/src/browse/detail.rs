@@ -451,10 +451,11 @@ pub fn playlist(window: &ZekeWindow, uuid: String) -> BrowsePage {
 }
 
 /// A mix, or a radio station: `kind` ("Track Radio") labels the page
-/// and names it in the navigation, `title` heads it until the mix's own
-/// title arrives.
+/// and names it in the navigation. The heading takes the mix's own
+/// title, else `title`, else the kind.
 pub fn mix(window: &ZekeWindow, id: String, title: Option<String>, kind: Option<&'static str>) -> BrowsePage {
     let kind = kind.unwrap_or("Mix");
+    let title = title.or_else(|| Some(kind.to_string()));
     open(window, kind, kind, Source::Mix { id, title }, TrackStyle::Mixed)
 }
 

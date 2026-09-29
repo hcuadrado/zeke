@@ -462,14 +462,18 @@ impl ZekeWindow {
     /// TIDAL has told it. One lookup at a time; activations while one is
     /// out are ignored.
     pub fn open_track_radio(&self, track: &TrackData) {
-        let title = format!("{} Radio", track.title);
+        let title = (!track.title.is_empty()).then(|| format!("{} Radio", track.title));
         if let Some(id) = &track.track_mix_id {
-            self.open(Target::Mix { id: id.clone(), title: Some(title), kind: Some("Track Radio") });
+            self.open_track_radio_page(id.clone(), title);
             return;
         }
-        if self.imp().radio_lookup.replace(true) {
+        let imp = self.imp();
+        if imp.radio_lookup.replace(true) {
             return;
         }
+        // A late answer opens nothing over a page the user has gone to
+        // since.
+        let from = imp.nav_view.visible_page();
         let state = Arc::clone(&self.session().state);
         let track_id = track.id;
         let window = self.downgrade();
@@ -477,7 +481,8 @@ impl ZekeWindow {
             let Some(window) = window.upgrade() else { return };
             window.imp().radio_lookup.set(false);
             match result {
-                Ok(Some(id)) => window.open(Target::Mix { id, title: Some(title), kind: Some("Track Radio") }),
+                Ok(Some(id)) if window.imp().nav_view.visible_page() == from => window.open_track_radio_page(id, title),
+                Ok(Some(_)) => log::info!("[browse] track {track_id}'s radio came after the user moved on"),
                 Ok(None) => {
                     log::info!("[browse] track {track_id} has no radio");
                     window.toast("No radio for this track");
@@ -487,6 +492,15 @@ impl ZekeWindow {
                 }
             }
         });
+    }
+
+    /// The radio page, with the Now Playing sheet (if it was open) out of
+    /// its way.
+    fn open_track_radio_page(&self, id: String, title: Option<String>) {
+        let imp = self.imp();
+        imp.sheet.set_open(false);
+        imp.split_view.set_show_content(true);
+        self.open(Target::Mix { id, title, kind: Some("Track Radio") });
     }
 }
 

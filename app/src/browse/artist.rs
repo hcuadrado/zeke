@@ -76,11 +76,11 @@ fn show(window: &ZekeWindow, shell: &Rc<Shell>, artist: u64, page: &ArtistPage) 
     }
 
     if let Some(id) = page.radio_mix_id.clone() {
-        let (w, title) = (window.downgrade(), format!("{} Radio", page.name));
+        let (w, title) = (window.downgrade(), (!page.name.is_empty()).then(|| format!("{} Radio", page.name)));
         heading.radio.set_visible(true);
         heading.radio.connect_clicked(move |_| {
             if let Some(window) = w.upgrade() {
-                window.open(Target::Mix { id: id.clone(), title: Some(title.clone()), kind: Some("Artist Radio") });
+                window.open(Target::Mix { id: id.clone(), title: title.clone(), kind: Some("Artist Radio") });
             }
         });
     }
