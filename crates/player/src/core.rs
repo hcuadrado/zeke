@@ -905,12 +905,17 @@ impl Core {
         };
         match self.queue.advance(true) {
             Advance::Next(item) | Advance::Wrapped(item) | Advance::Same(item) => self.start_load(item, waiting.via, fx),
+            // A failed radio is an error, like an unplayable load: no
+            // QueueEnded, so a headless caller doesn't read it as success.
             Advance::End => {
-                self.end_queue(fx);
-                fx.push(Effect::Emit(match failure.flatten() {
-                    Some(e) => PlayerEvent::Error { kind: e.kind, message: e.message },
-                    None => PlayerEvent::Notice("No more tracks: the radio came back empty".into()),
-                }));
+                self.stop(fx);
+                match failure.flatten() {
+                    Some(e) => fx.push(Effect::Emit(PlayerEvent::Error { kind: e.kind, message: e.message })),
+                    None => {
+                        fx.push(Effect::Emit(PlayerEvent::Notice("No more tracks: no radio to continue with".into())));
+                        fx.push(Effect::Emit(PlayerEvent::QueueEnded));
+                    }
+                }
             }
         }
     }
@@ -3080,18 +3085,42 @@ mod tests {
 
     #[test]
     fn an_empty_or_failed_radio_ends_the_queue() {
+        // The stop, the reason, then (only for an empty radio) the end.
+        let events = |fx: &[Effect]| -> Vec<PlayerEvent> {
+            fx.iter()
+                .filter_map(|e| match e {
+                    Effect::Emit(
+                        ev @ (PlayerEvent::State(_) | PlayerEvent::Notice(_) | PlayerEvent::Error { .. } | PlayerEvent::QueueEnded),
+                    ) => Some(ev.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
         for ids in [&[][..], &[1, 1][..]] {
             let (mut h, fetch) = waiting_at_end(&[1]);
             let fx = h.answer(fetch, ids);
-            assert!(ended(&fx), "{ids:?}");
-            assert!(fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::Notice(n)) if n.contains("radio came back empty"))));
+            assert_eq!(
+                events(&fx),
+                vec![
+                    PlayerEvent::State(PlaybackState::Stopped),
+                    PlayerEvent::Notice("No more tracks: no radio to continue with".into()),
+                    PlayerEvent::QueueEnded,
+                ],
+                "{ids:?}"
+            );
             assert_eq!(h.core.state(), PlaybackState::Stopped);
         }
         let (mut h, fetch) = waiting_at_end(&[1]);
         let err = ResolveError { message: "401".into(), kind: ErrorKind::LoginExpired };
         let fx = h.send(Input::RadioFetched { fetch, result: Err(err) });
-        assert!(ended(&fx));
-        assert!(fx.iter().any(|e| matches!(e, Effect::Emit(PlayerEvent::Error { kind: ErrorKind::LoginExpired, .. }))));
+        assert_eq!(
+            events(&fx),
+            vec![
+                PlayerEvent::State(PlaybackState::Stopped),
+                PlayerEvent::Error { kind: ErrorKind::LoginExpired, message: "401".into() },
+            ]
+        );
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
     }
 
     #[test]
