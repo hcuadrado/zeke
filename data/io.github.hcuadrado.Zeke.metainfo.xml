@@ -59,6 +59,16 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.3.0" date="2026-09-28">
+      <description>
+        <p>
+          TIDAL radio. Every track's menu goes to its radio, the artist page
+          has a Radio button, and so does Now Playing for the track that is
+          playing. The station opens as a page, labelled Track Radio or
+          Artist Radio, to play or shuffle from there.
+        </p>
+      </description>
+    </release>
     <release version="0.2.2" date="2026-09-26">
       <description>
         <p>
