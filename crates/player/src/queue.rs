@@ -33,6 +33,10 @@ pub struct TrackInfo {
     pub cover: Option<String>,
     /// Seconds, from TIDAL's metadata (rounded).
     pub duration: Option<f64>,
+    /// The track radio's mix id, when the page had it. Left out of the
+    /// saved queue when unknown, so older queues load and read the same.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub track_mix_id: Option<String>,
 }
 
 /// A track to queue: its ID and, when a page queued it, its metadata. An

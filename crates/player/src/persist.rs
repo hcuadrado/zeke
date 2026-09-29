@@ -127,6 +127,7 @@ mod tests {
             album: "The Dark Side of the Moon".into(),
             cover: Some("ab-cd".into()),
             duration: Some(413.0),
+            track_mix_id: None,
         };
         PersistedQueue {
             tracks: vec![
@@ -179,6 +180,18 @@ mod tests {
         assert_eq!(v["tracks"][0], serde_json::json!({"id": 455128517}), "no metadata, no field");
         assert_eq!(v["tracks"][1]["info"]["title"], "Time");
         assert_eq!(v["tracks"][1]["info"]["duration"], 413.0);
+        assert!(v["tracks"][1]["info"].get("track_mix_id").is_none(), "an unknown radio adds no field");
+    }
+
+    #[test]
+    fn a_known_radio_is_saved_and_an_old_queue_still_loads() {
+        let mut queue = sample();
+        queue.tracks[1].info.as_mut().unwrap().track_mix_id = Some("0012ab".into());
+        let v = serde_json::to_value(&queue).unwrap();
+        assert_eq!(v["tracks"][1]["info"]["track_mix_id"], "0012ab");
+        assert_eq!(serde_json::from_value::<PersistedQueue>(v).unwrap(), queue);
+        let old = serde_json::to_value(sample()).unwrap();
+        assert_eq!(serde_json::from_value::<PersistedQueue>(old).unwrap(), sample());
     }
 
     #[test]
