@@ -318,10 +318,14 @@ async fn radio(state: &AppState, seed: &QueueItem) -> Result<Vec<QueueTrack>, Re
     let failed = |e: TidalError| ResolveError { message: describe(&e), kind: error_kind(&e) };
     let mix_id = match seed.info.as_ref().and_then(|i| i.track_mix_id.clone()) {
         Some(id) => id,
-        None => browse::track_mix_id(state, seed.track_id).await.map_err(failed)?.ok_or_else(|| ResolveError {
-            message: format!("track {} has no radio", seed.track_id),
-            kind: ErrorKind::Other,
-        })?,
+        None => match browse::track_mix_id(state, seed.track_id).await.map_err(failed)? {
+            Some(id) => id,
+            // Not a failure: a radio with nothing in it.
+            None => {
+                log::info!("[player] track {} has no radio", seed.track_id);
+                return Ok(Vec::new());
+            }
+        },
     };
     let mix = browse::mix_fresh(state, &mix_id).await.map_err(failed)?;
     let total = mix.tracks.len();
