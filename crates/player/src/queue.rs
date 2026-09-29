@@ -473,6 +473,48 @@ impl Queue {
         }
     }
 
+    /// Append at the end of the play order, in the order given, shuffle or
+    /// not: a radio's sequencing is part of what it offers. Anything
+    /// already upcoming stays ahead.
+    pub fn append_in_order(&mut self, tracks: impl IntoIterator<Item = QueueTrack>, origin: Origin) {
+        self.revision += 1;
+        for track in tracks {
+            let item = self.stamp_as(track, origin);
+            self.items.push(item);
+            if self.order.is_empty() {
+                self.pos = 0;
+            }
+            self.order.push(self.items.len() - 1);
+        }
+    }
+
+    /// Drop the oldest history entries so at most `keep` remain. The
+    /// current and upcoming entries are never touched. `items` shrinks with
+    /// the history (a shuffled queue saves all of `items`), and `order` is
+    /// remapped onto what is left.
+    pub fn trim_history(&mut self, keep: usize) {
+        let Some(drop) = self.pos.checked_sub(keep).filter(|&n| n > 0) else { return };
+        self.revision += 1;
+        let mut gone = vec![false; self.items.len()];
+        for &i in &self.order[..drop] {
+            gone[i] = true;
+        }
+        // Old index → new index, for the entries that stay.
+        let mut new_index = vec![0; self.items.len()];
+        let mut kept = 0;
+        for (i, &g) in gone.iter().enumerate() {
+            new_index[i] = kept;
+            kept += usize::from(!g);
+        }
+        let mut i = 0;
+        self.items.retain(|_| {
+            i += 1;
+            !gone[i - 1]
+        });
+        self.order = self.order[drop..].iter().map(|&i| new_index[i]).collect();
+        self.pos -= drop;
+    }
+
     /// Play next: right after the current track.
     pub fn play_next(&mut self, track: impl Into<QueueTrack>) {
         self.revision += 1;
@@ -849,6 +891,64 @@ mod tests {
         let after: Vec<u64> = play_order(&q).into_iter().filter(|t| *t < 100).collect();
         assert_eq!(after, before);
         assert_eq!(play_order(&q)[0], before[0], "never before the current track");
+    }
+
+    #[test]
+    fn a_radio_goes_to_the_end_of_the_play_order_in_its_own_order() {
+        let mut q = Queue::new(9);
+        q.load(1..=6u64, Some(0), true);
+        q.append([7]); // somewhere upcoming, shuffled
+        let before = play_order(&q);
+        q.append_in_order(QueueTrack::from_ids(&[100, 101, 102]), Origin::Radio { seed: 6 });
+        let after = play_order(&q);
+        assert_eq!(&after[..before.len()], &before[..], "what was queued stays ahead");
+        assert_eq!(&after[before.len()..], &[100, 101, 102]);
+        let origins: Vec<Origin> = q.in_order().skip(before.len()).map(|i| i.origin).collect();
+        assert_eq!(origins, vec![Origin::Radio { seed: 6 }; 3]);
+        assert!(q.in_order().take(before.len()).all(|i| i.origin.is_queued()));
+        // Onto an empty queue: the first entry becomes current.
+        let mut q = Queue::new(1);
+        q.append_in_order(QueueTrack::from_ids(&[5, 6]), Origin::Queued);
+        assert_eq!(q.current().unwrap().track_id, 5);
+    }
+
+    #[test]
+    fn trimming_history_keeps_the_queue_consistent() {
+        let mut q = Queue::new(13);
+        q.load(1..=10u64, Some(0), true);
+        for _ in 0..6 {
+            q.advance(false);
+        }
+        q.append_in_order(QueueTrack::from_ids(&[100, 101]), Origin::Radio { seed: 1 });
+        let order = play_order(&q);
+        let current = q.current().unwrap().clone();
+        let rev = q.revision();
+        q.trim_history(2);
+        assert!(q.revision() > rev);
+        assert_eq!(q.items.len(), q.order.len());
+        let mut sorted = q.order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..q.items.len()).collect::<Vec<_>>(), "order is a permutation of items");
+        assert_eq!(q.position(), (2, 8));
+        assert_eq!(q.current(), Some(&current));
+        assert_eq!(play_order(&q), order[4..], "the oldest four went, nothing else");
+        // Less history than `keep`: nothing changes.
+        let rev = q.revision();
+        q.trim_history(5);
+        assert_eq!((q.revision(), play_order(&q)), (rev, order[4..].to_vec()));
+        // The saved queue round-trips, origins included.
+        let back = Queue::from_persisted(&q.to_persisted(0, false), 1).unwrap();
+        assert_eq!(play_order(&back), play_order(&q));
+        assert_eq!(back.current().unwrap().track_id, current.track_id);
+        let origins = |q: &Queue| q.in_order().map(|i| i.origin).collect::<Vec<_>>();
+        assert_eq!(origins(&back), origins(&q));
+        assert_eq!(origins(&back).last(), Some(&Origin::Radio { seed: 1 }));
+        // Shuffle off: history in any order is trimmed the same way.
+        q.set_shuffle(false);
+        q.advance(false);
+        q.trim_history(0);
+        assert_eq!(q.position(), (0, 5));
+        assert_eq!(q.items.len(), 5);
     }
 
     #[test]
