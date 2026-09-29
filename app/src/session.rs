@@ -15,8 +15,8 @@ use zeke_engine::events::{self, EngineEvent};
 use zeke_engine::pipeline_probe::PipelineProbe;
 use zeke_engine::{acquire, devices, reserve, SignalPath, SignalPathTracker};
 use zeke_player::{
-    Config, ErrorKind, PersistedQueue, PlaybackState, Player, PlayerCommand, PlayerConfig, PlayerEvent, QueueItem,
-    RepeatMode, StreamFormat, TrackInfo, Transition, Update,
+    Config, ErrorKind, Origin, PersistedQueue, PlaybackState, Player, PlayerCommand, PlayerConfig, PlayerEvent,
+    QueueItem, RepeatMode, StreamFormat, TrackInfo, Transition, Update,
 };
 use zeke_tidal::client_lock::{self, Caller};
 use zeke_tidal::{AppState, ColorScheme, Settings, TidalError};
@@ -289,6 +289,11 @@ impl Session {
         self.change_settings(move |s| s.gapless = on);
     }
 
+    pub fn set_continuous(&self, on: bool) {
+        self.send(PlayerCommand::SetContinuous(on));
+        self.change_settings(move |s| s.continuous = on);
+    }
+
     pub fn set_normalization(&self, on: bool) {
         self.send(PlayerCommand::SetNormalization(on));
         self.change_settings(move |s| s.volume_normalization = on);
@@ -408,6 +413,7 @@ async fn run(
                 gapless: settings.gapless,
                 normalization: settings.volume_normalization,
                 max_quality: settings.max_quality.clone(),
+                continuous: settings.continuous,
                 ..Config::default()
             },
             seed: None,
@@ -532,6 +538,9 @@ async fn hub(
     let mut current: Option<(u64, Option<f64>)> = None;
     let mut order: (Vec<u64>, usize) = (Vec::new(), 0);
     let mut playing = false;
+    // How the last track started came into the queue: the radio taking
+    // over is worth a word.
+    let mut last_origin: Option<Origin> = None;
     let mut probe_tick = tokio::time::interval(Duration::from_secs(5));
     probe_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -604,6 +613,10 @@ async fn hub(
                 // track's title (or its trackid for SetPosition).
                 let shown = meta.clone().unwrap_or_else(|| TrackMeta::placeholder(item.track_id));
                 mpris.send(MprisCommand::metadata(&shown, duration));
+                let origin = item.origin;
+                if let Some(text) = radio_takes_over(last_origin.replace(origin), origin, via, &cache) {
+                    let _ = ui.send(UiEvent::Notice(text)).await;
+                }
                 let _ = ui.send(UiEvent::TrackStarted { item, duration, format, meta }).await;
                 wants_tx.send_replace(wish_list(&order, current, &cache, &failed));
                 // The writer has (re)negotiated by then; read the DAC. A
@@ -700,6 +713,24 @@ async fn hub(
     fetcher.abort();
 }
 
+/// The toast when a radio track follows a queued one (not on a restore,
+/// which plays nothing yet).
+fn radio_takes_over(
+    before: Option<Origin>,
+    now: Origin,
+    via: Transition,
+    cache: &HashMap<u64, TrackMeta>,
+) -> Option<String> {
+    let Origin::Radio { seed } = now else { return None };
+    if before != Some(Origin::Queued) || via == Transition::Restore {
+        return None;
+    }
+    Some(match cache.get(&seed) {
+        Some(meta) => format!("Continuing with radio from “{}”", meta.title),
+        None => "Continuing with radio".to_string(),
+    })
+}
+
 /// The tracks whose metadata to fetch, most wanted first: the current one,
 /// then upcoming, then recent history. Skips cached and recently failed ones.
 fn wish_list(
@@ -789,6 +820,28 @@ mod tests {
         assert_eq!(read.1, "Daft Punk, Romanthony");
         assert_eq!((row.title.as_str(), row.duration), (read.0.as_str(), Some(320)));
         assert_eq!(TrackMeta::from_json(7, &serde_json::json!({"artist": {"name": "X"}})).title, "Track 7");
+    }
+
+    #[test]
+    fn the_radio_taking_over_is_announced_once() {
+        let mut cache = HashMap::new();
+        let mut seed = TrackMeta::placeholder(7);
+        seed.title = "Around the World".into();
+        cache.insert(7, seed);
+        let radio = Origin::Radio { seed: 7 };
+        let toast = |before, now, via| radio_takes_over(before, now, via, &cache);
+        assert_eq!(
+            toast(Some(Origin::Queued), radio, Transition::Gapless).as_deref(),
+            Some("Continuing with radio from “Around the World”")
+        );
+        assert_eq!(toast(Some(radio), radio, Transition::Gapless), None, "already on the radio");
+        assert_eq!(toast(None, radio, Transition::Restore), None);
+        assert_eq!(toast(Some(Origin::Queued), radio, Transition::Restore), None);
+        assert_eq!(toast(Some(Origin::Queued), Origin::Queued, Transition::AfterEnd), None);
+        assert_eq!(
+            toast(Some(Origin::Queued), Origin::Radio { seed: 8 }, Transition::Skip).as_deref(),
+            Some("Continuing with radio")
+        );
     }
 
     #[test]
