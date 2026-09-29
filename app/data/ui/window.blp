@@ -425,6 +425,19 @@ template $ZekeWindow: Adw.ApplicationWindow {
                             "heart",
                           ]
                         }
+
+                        Button sheet_radio {
+                          icon-name: "radio-station-symbolic";
+                          tooltip-text: "Track Radio";
+                          valign: center;
+                          sensitive: false;
+                          clicked => $on_sheet_radio() swapped;
+
+                          styles [
+                            "flat",
+                            "circular",
+                          ]
+                        }
                       }
 
                       Box {

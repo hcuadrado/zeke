@@ -16,12 +16,15 @@ pub mod views;
 
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use adw::prelude::*;
 use adw::subclass::prelude::*;
 use gtk::{gio, glib};
 use zeke_player::PlayerCommand;
+use zeke_tidal::commands::browse;
 
+use crate::runtime;
 use crate::window::ZekeWindow;
 use model::{CardKind, CardObject, TrackData};
 
@@ -68,7 +71,10 @@ impl Root {
 pub enum Target {
     Album(u64),
     Playlist(String),
-    Mix(String),
+    /// A mix, or a radio station (TIDAL serves those as mixes). `kind`
+    /// labels the page ("Mix" when `None`); `title` stands in until the
+    /// mix brings its own.
+    Mix { id: String, title: Option<String>, kind: Option<&'static str> },
     Artist(u64),
     /// A Home section's "view all" (`get_page_section`).
     ViewAll { title: String, api_path: String },
@@ -194,7 +200,7 @@ impl Shell {
 }
 
 /// A detail page's heading: picture, a kind line ("Album"), title,
-/// subtitle, details, and Play / Shuffle.
+/// subtitle, details, and Play / Shuffle (and Radio, where there is one).
 pub struct Heading {
     pub widget: gtk::Box,
     pub picture: gtk::Picture,
@@ -203,6 +209,8 @@ pub struct Heading {
     pub details: gtk::Label,
     pub play: gtk::Button,
     pub shuffle: gtk::Button,
+    /// Hidden until a page that has a radio shows it.
+    pub radio: gtk::Button,
     /// Hidden until the page binds it (`hearts::bind_heart`).
     pub heart: gtk::Button,
 }
@@ -231,10 +239,16 @@ impl Heading {
             .css_classes(["pill"])
             .sensitive(false)
             .build();
+        let radio = gtk::Button::builder()
+            .child(&adw::ButtonContent::builder().icon_name("radio-station-symbolic").label("Radio").build())
+            .css_classes(["pill"])
+            .visible(false)
+            .build();
         let heart = crate::hearts::heart_button();
         let buttons = gtk::Box::builder().spacing(12).margin_top(8).build();
         buttons.append(&play);
         buttons.append(&shuffle);
+        buttons.append(&radio);
         buttons.append(&heart);
         let text = gtk::Box::builder().orientation(gtk::Orientation::Vertical).spacing(4).valign(gtk::Align::Center).hexpand(true).build();
         for w in [kind.upcast_ref::<gtk::Widget>(), title.upcast_ref(), subtitle.upcast_ref(), details.upcast_ref(), buttons.upcast_ref()] {
@@ -244,7 +258,7 @@ impl Heading {
         // A picture's natural size is its texture's; the clamp holds it.
         widget.append(&adw::Clamp::builder().maximum_size(200).valign(gtk::Align::Center).child(&picture).build());
         widget.append(&text);
-        Self { widget, picture, title, subtitle, details, play, shuffle, heart }
+        Self { widget, picture, title, subtitle, details, play, shuffle, radio, heart }
     }
 }
 
@@ -368,7 +382,7 @@ impl ZekeWindow {
         let page: BrowsePage = match target {
             Target::Album(id) => detail::album(self, id),
             Target::Playlist(uuid) => detail::playlist(self, uuid),
-            Target::Mix(id) => detail::mix(self, id),
+            Target::Mix { id, title, kind } => detail::mix(self, id, title, kind),
             Target::Artist(id) => artist::page(self, id),
             Target::ViewAll { title, api_path } => home::view_all(self, title, api_path),
             Target::ArtistViewAll { title, artist, path, tracks } => artist::view_all(self, title, artist, path, tracks),
@@ -382,7 +396,7 @@ impl ZekeWindow {
         match &card.data().kind {
             CardKind::Album(id) => self.open(Target::Album(*id)),
             CardKind::Playlist(uuid) => self.open(Target::Playlist(uuid.clone())),
-            CardKind::Mix(id) => self.open(Target::Mix(id.clone())),
+            CardKind::Mix(id) => self.open(Target::Mix { id: id.clone(), title: None, kind: None }),
             CardKind::Artist(id) => self.open(Target::Artist(*id)),
             CardKind::MyTracks => self.show_root(Root::FavoriteTracks),
             CardKind::Track(_) => {
@@ -442,6 +456,51 @@ impl ZekeWindow {
     pub fn add_to_queue(&self, track: &TrackData) {
         self.send(PlayerCommand::Append(vec![track.queue_track()]));
         self.toast(&format!("Added “{}” to the queue", track.title));
+    }
+
+    /// Open the track's radio: at once when its mix id is known, else once
+    /// TIDAL has told it. One lookup at a time; activations while one is
+    /// out are ignored.
+    pub fn open_track_radio(&self, track: &TrackData) {
+        let title = (!track.title.is_empty()).then(|| format!("{} Radio", track.title));
+        if let Some(id) = &track.track_mix_id {
+            self.open_track_radio_page(id.clone(), title);
+            return;
+        }
+        let imp = self.imp();
+        if imp.radio_lookup.replace(true) {
+            return;
+        }
+        // A late answer opens nothing over a page the user has gone to
+        // since.
+        let from = imp.nav_view.visible_page();
+        let state = Arc::clone(&self.session().state);
+        let track_id = track.id;
+        let window = self.downgrade();
+        runtime::spawn(async move { browse::track_mix_id(&state, track_id).await }, move |result| {
+            let Some(window) = window.upgrade() else { return };
+            window.imp().radio_lookup.set(false);
+            match result {
+                Ok(Some(id)) if window.imp().nav_view.visible_page() == from => window.open_track_radio_page(id, title),
+                Ok(Some(_)) => log::info!("[browse] track {track_id}'s radio came after the user moved on"),
+                Ok(None) => {
+                    log::info!("[browse] track {track_id} has no radio");
+                    window.toast("No radio for this track");
+                }
+                Err(e) => {
+                    window.report("find the track’s radio", &e);
+                }
+            }
+        });
+    }
+
+    /// The radio page, with the Now Playing sheet (if it was open) out of
+    /// its way.
+    fn open_track_radio_page(&self, id: String, title: Option<String>) {
+        let imp = self.imp();
+        imp.sheet.set_open(false);
+        imp.split_view.set_show_content(true);
+        self.open(Target::Mix { id, title, kind: Some("Track Radio") });
     }
 }
 

@@ -124,6 +124,8 @@ mod imp {
         pub bar_heart: TemplateChild<gtk::Button>,
         #[template_child]
         pub sheet_heart: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub sheet_radio: TemplateChild<gtk::Button>,
 
         pub session: OnceCell<Rc<Session>>,
         pub plugins: OnceCell<Rc<crate::plugins::Host>>,
@@ -158,6 +160,8 @@ mod imp {
         /// Bumped whenever the queue is replaced: a page still loading the
         /// queue it started appends the rest only while this is unchanged.
         pub queue_generation: Cell<u64>,
+        /// Set while a track radio's mix id is being looked up.
+        pub radio_lookup: Cell<bool>,
         /// The output devices as last listed.
         pub output_devices: RefCell<Vec<zeke_engine::audio::AudioDevice>>,
         /// Set while the devices are being listed.
@@ -433,6 +437,11 @@ impl ZekeWindow {
     #[template_callback]
     fn on_close_sheet(&self) {
         self.imp().sheet.set_open(false);
+    }
+
+    #[template_callback]
+    fn on_sheet_radio(&self) {
+        self.open_playing_radio();
     }
 
     #[template_callback]

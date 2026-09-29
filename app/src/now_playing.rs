@@ -202,6 +202,22 @@ impl ZekeWindow {
         self.covers().show(&imp.sheet_cover, url(covers::SHEET));
         self.refresh_badge();
         self.refresh_hearts();
+        imp.sheet_radio.set_sensitive(true);
+    }
+
+    /// The sheet's Radio button: the playing track's radio. The sheet
+    /// closes only when the page opens; a toast shows over it.
+    pub fn open_playing_radio(&self) {
+        let imp = self.imp();
+        let Some(id) = imp.now.borrow().as_ref().map(|n| n.track_id) else { return };
+        let meta = imp.metas.borrow().get(&id).cloned();
+        let track = crate::browse::model::TrackData {
+            id,
+            title: meta.as_ref().map(|m| m.title.clone()).unwrap_or_default(),
+            track_mix_id: meta.and_then(|m| m.track_mix_id),
+            ..Default::default()
+        };
+        self.open_track_radio(&track);
     }
 
     pub fn refresh_badge(&self) {
@@ -273,6 +289,7 @@ impl ZekeWindow {
         imp.queue_qids.borrow_mut().clear();
         imp.queue_current.set(None);
         self.refresh_hearts();
+        imp.sheet_radio.set_sensitive(false);
     }
 
     /// Bring the list in line with the player's queue by replacing only

@@ -11,6 +11,7 @@ use gtk::glib;
 use gtk::subclass::prelude::*;
 use serde_json::Value;
 use zeke_player::{QueueTrack, TrackInfo};
+use zeke_tidal::commands::browse::track_mix;
 
 use crate::covers::{self, Kind};
 
@@ -34,6 +35,8 @@ pub struct TrackData {
     pub explicit: bool,
     /// TIDAL tags it hi-res lossless.
     pub hires: bool,
+    /// The track radio's mix id, when the list item carries it.
+    pub track_mix_id: Option<String>,
 }
 
 fn text(v: &Value) -> Option<&str> {
@@ -137,6 +140,7 @@ impl TrackData {
             number: v["trackNumber"].as_u64().map(|n| n as u32),
             explicit: v["explicit"].as_bool().unwrap_or(false),
             hires,
+            track_mix_id: track_mix(v),
         })
     }
 
@@ -155,6 +159,7 @@ impl TrackData {
                 album: self.album.clone(),
                 cover: self.cover.clone(),
                 duration: self.duration.map(f64::from),
+                track_mix_id: self.track_mix_id.clone(),
             },
         )
     }
@@ -514,6 +519,11 @@ mod tests {
         let q = t.queue_track();
         let info = q.info.unwrap();
         assert_eq!((q.id, info.album.as_str(), info.cover.as_deref(), info.duration), (1, "Al", Some("c-1"), Some(200.0)));
+        assert_eq!(t.track_mix_id, None, "no mixes in the item");
+        v["mixes"] = json!({"TRACK_MIX": "0012ab"});
+        let t = TrackData::from_value(&v).unwrap();
+        assert_eq!(t.track_mix_id.as_deref(), Some("0012ab"));
+        assert_eq!(t.queue_track().info.unwrap().track_mix_id.as_deref(), Some("0012ab"), "the queue keeps it");
         assert_eq!(TrackData::from_value(&json!({"_itemType": "VIDEO", "id": 3, "title": "V"})), None);
         assert_eq!(TrackData::from_value(&json!({"id": 3, "title": "V", "itemType": "video"})), None);
     }

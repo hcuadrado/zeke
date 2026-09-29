@@ -27,7 +27,8 @@ use crate::window::ZekeWindow;
 pub enum Source {
     Album(u64),
     Playlist(String),
-    Mix(String),
+    /// `title`: the heading's title when the mix has none of its own.
+    Mix { id: String, title: Option<String> },
     Favorites,
     ArtistViewAll { artist: u64, path: String },
 }
@@ -162,11 +163,11 @@ async fn fetch(state: Arc<AppState>, source: Source, offset: u32) -> Result<Batc
             let tracks = page.items.iter().filter_map(TrackData::from_typed).collect();
             Ok(Batch { head, tracks, total: Some(page.total_number_of_items), next })
         }
-        Source::Mix(id) => {
+        Source::Mix { id, title } => {
             let mix = browse::mix(&state, &id).await?;
             let tracks: Vec<TrackData> = mix.tracks.iter().filter_map(TrackData::from_typed).collect();
             let head = Head {
-                title: mix.title.clone().unwrap_or_else(|| "Mix".into()),
+                title: mix.title.clone().filter(|t| !t.is_empty()).or(title).unwrap_or_else(|| "Mix".into()),
                 subtitle: mix.subtitle.clone().unwrap_or_default(),
                 details: count(tracks.len()),
                 image: mix.image.clone().map(|i| Image::Id(i, Kind::Album)),
@@ -416,7 +417,7 @@ impl TrackPage {
         match &self.source {
             Source::Album(id) => format!("album {id}"),
             Source::Playlist(uuid) => format!("playlist {uuid}"),
-            Source::Mix(id) => format!("mix {id}"),
+            Source::Mix { id, .. } => format!("mix {id}"),
             Source::Favorites => "favorite tracks".into(),
             Source::ArtistViewAll { path, .. } => path.clone(),
         }
@@ -449,8 +450,13 @@ pub fn playlist(window: &ZekeWindow, uuid: String) -> BrowsePage {
     open(window, "Playlist", "Playlist", Source::Playlist(uuid), TrackStyle::Mixed)
 }
 
-pub fn mix(window: &ZekeWindow, id: String) -> BrowsePage {
-    open(window, "Mix", "Mix", Source::Mix(id), TrackStyle::Mixed)
+/// A mix, or a radio station: `kind` ("Track Radio") labels the page
+/// and names it in the navigation. The heading takes the mix's own
+/// title, else `title`, else the kind.
+pub fn mix(window: &ZekeWindow, id: String, title: Option<String>, kind: Option<&'static str>) -> BrowsePage {
+    let kind = kind.unwrap_or("Mix");
+    let title = title.or_else(|| Some(kind.to_string()));
+    open(window, kind, kind, Source::Mix { id, title }, TrackStyle::Mixed)
 }
 
 pub fn favorite_tracks(window: &ZekeWindow) -> BrowsePage {
