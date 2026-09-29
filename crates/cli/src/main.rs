@@ -82,6 +82,10 @@ enum Command {
         /// Only --jump in the first track, then play through
         #[arg(long, requires = "jump")]
         jump_first: bool,
+        /// When the queue ends, keep going with the last track's radio
+        /// (whatever the saved setting says)
+        #[arg(long)]
+        continuous: bool,
         #[command(flatten)]
         output: OutputArgs,
     },
@@ -210,9 +214,9 @@ async fn run(command: Command, state: Option<Arc<AppState>>) -> Result<(), Strin
             let opts = output.resolve(&state.load_settings().unwrap_or_default());
             play(&state, id, opts).await
         }
-        Command::PlayQueue { ids, album, shuffle, repeat, start, jump, jump_first, output } => {
+        Command::PlayQueue { ids, album, shuffle, repeat, start, jump, jump_first, continuous, output } => {
             let opts = output.resolve(&state.load_settings().unwrap_or_default());
-            let queue = QueueOptions { ids, album, shuffle, repeat: repeat.into(), start, jump, jump_first };
+            let queue = QueueOptions { ids, album, shuffle, repeat: repeat.into(), start, jump, jump_first, continuous };
             play_queue(state, queue, opts).await
         }
     }
@@ -538,6 +542,7 @@ struct QueueOptions {
     start: Option<usize>,
     jump: Option<f64>,
     jump_first: bool,
+    continuous: bool,
 }
 
 /// The ALSA writer's silence writes and xruns so far, for the log.
@@ -583,13 +588,14 @@ async fn play_queue(state: Arc<AppState>, mut q: QueueOptions, opts: PlayOptions
         }
     }
     log::info!(
-        "[cli] shuffle={} repeat={:?} start={:?} gain={} gapless={} normalization={}",
+        "[cli] shuffle={} repeat={:?} start={:?} gain={} gapless={} normalization={} continuous={}",
         q.shuffle,
         q.repeat,
         q.start,
         if q.album.is_some() { "album" } else { "track" },
         saved.gapless,
-        saved.volume_normalization
+        saved.volume_normalization,
+        q.continuous
     );
 
     let (engine, _signal_path, rx) = start_engine(&opts, &saved)?;
@@ -604,6 +610,7 @@ async fn play_queue(state: Arc<AppState>, mut q: QueueOptions, opts: PlayOptions
                 normalization: saved.volume_normalization,
                 max_quality: opts.quality.clone(),
                 bit_perfect: opts.bit_perfect,
+                continuous: q.continuous,
                 ..Config::default()
             },
             seed: None,
@@ -654,10 +661,11 @@ async fn play_queue(state: Arc<AppState>, mut q: QueueOptions, opts: PlayOptions
                     PlayerEvent::State(s) => log::info!("[player] state {s:?}"),
                     PlayerEvent::TrackStarted { item, index, len, via, summary, duration, .. } => {
                         log::info!(
-                            "[player] now playing {} ({}/{len}, qid {}) via {via:?}: {} length {} ({})",
+                            "[player] now playing {} ({}/{len}, qid {}, {:?}) via {via:?}: {} length {} ({})",
                             item.track_id,
                             index + 1,
                             item.qid,
+                            item.origin,
                             summary.as_deref().unwrap_or("-"),
                             secs(duration),
                             writer_counters(),
