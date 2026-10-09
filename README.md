@@ -34,6 +34,8 @@ MVP: the core player is complete. What it does today:
   on by default and can be turned off in Preferences › Playback.
 - **Desktop:** a quality badge (e.g. FLAC 24/192), MPRIS media controls,
   keyboard shortcuts, light and dark styles.
+- **Sleep:** the computer doesn't suspend while music plays; the screen
+  still blanks and locks (see [Sleep while playing](#sleep-while-playing)).
 
 ### Next
 
@@ -69,6 +71,21 @@ example `aplay` or JACK), Zeke says so, switches to System Default and
 plays the track there. The saved device is also checked at startup: if
 it's missing or another app holds it directly, Zeke starts on System
 Default.
+
+## Sleep while playing
+
+While a track plays (or the next one loads), Zeke holds a logind lock
+that keeps the computer from suspending, so an idle timeout doesn't cut a
+song off. Pausing, stopping or quitting releases it. Only sleep is held
+off: the screen still blanks and locks as usual. `systemd-inhibit --list`
+shows the lock as `Zeke … sleep … Playing music … block`.
+
+- A suspend you ask for is refused too while music plays: pause first,
+  or use `systemctl suspend -i`.
+- Closing the lid still suspends (logind's default
+  `LidSwitchIgnoreInhibited=yes`).
+- systemd 257 or later is needed for the lock to hold against your own
+  session's idle suspend; with an older one Zeke logs a warning.
 
 ## Layout
 
