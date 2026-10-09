@@ -3417,7 +3417,7 @@ dependencies = [
 
 [[package]]
 name = "zeke"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-channel",
  "glib-build-tools",
@@ -3440,7 +3440,7 @@ dependencies = [
 
 [[package]]
 name = "zeke-cli"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-channel",
  "clap",
@@ -3454,7 +3454,7 @@ dependencies = [
 
 [[package]]
 name = "zeke-engine"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "alsa",
  "async-channel",
@@ -3471,7 +3471,7 @@ dependencies = [
 
 [[package]]
 name = "zeke-player"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "async-channel",
  "log",
@@ -3485,7 +3485,7 @@ dependencies = [
 
 [[package]]
 name = "zeke-plugin"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "gtk4",
  "tokio",
@@ -3494,7 +3494,7 @@ dependencies = [
 
 [[package]]
 name = "zeke-plugin-cast"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "gtk4",
  "libadwaita",
@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "zeke-tidal"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "base64 0.21.7",
