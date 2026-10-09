@@ -10,6 +10,10 @@
 //! seconds of the current track's end, not as soon as it is predicted,
 //! because stream URLs expire.
 //!
+//! For the same reason a track paused for `reload_after_pause` seconds is
+//! resolved again on resume and picks up where it was, and a track whose
+//! stream starts answering 403 mid-play is reloaded once the same way.
+//!
 //! Continuous playback: with repeat off, once the queue's last track is
 //! within `radio_window` of its end, its track radio is fetched and
 //! appended, so the prefetch finds a next track and the first radio track
@@ -30,6 +34,8 @@ const RESTART_THRESHOLD_SECS: f64 = 3.0;
 /// History kept when a radio is appended, so a queue that runs on radio
 /// for days stays small.
 const HISTORY_KEPT: usize = 200;
+/// A second expired-URL error this soon after a reload stops playback.
+const RELOAD_MEMO_SECS: f64 = 60.0;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -53,6 +59,9 @@ pub struct Config {
     /// Fetch that radio this close to the last track's end: ahead of
     /// `prefetch_window`, so the first radio track can be armed in time.
     pub radio_window: f64,
+    /// Resolve the current track again when it is resumed after a pause
+    /// this long: by then its stream URLs may have expired.
+    pub reload_after_pause: f64,
 }
 
 impl Default for Config {
@@ -66,6 +75,7 @@ impl Default for Config {
             exclusive: false,
             continuous: false,
             radio_window: 75.0,
+            reload_after_pause: 600.0,
         }
     }
 }
@@ -154,6 +164,9 @@ pub enum Transition {
     Jump,
     /// A saved queue was restored (nothing plays yet).
     Restore,
+    /// The current track was resolved again (its stream URLs expired) and
+    /// picks up where it was.
+    Reload,
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +469,10 @@ pub struct Core {
     /// Generation of radio fetches.
     radio_gen: u64,
     waiting: Option<Waiting>,
+    /// `now` when playback was last paused.
+    paused_at: Option<f64>,
+    /// `now` of the last reload after an expired-URL error.
+    reloaded_at: Option<f64>,
 }
 
 impl Core {
@@ -485,6 +502,8 @@ impl Core {
             radio: None,
             radio_gen: 0,
             waiting: None,
+            paused_at: None,
+            reloaded_at: None,
         }
     }
 
@@ -529,18 +548,7 @@ impl Core {
                 self.track_advanced(track_id, qid, replay_gain, peak_amplitude, &mut fx)
             }
             Input::TrackFinished => self.track_finished(&mut fx),
-            Input::AudioError { kind, message } => {
-                // Restored: nothing is loaded, so the error isn't this queue's.
-                if !matches!(self.state, PlaybackState::Stopped | PlaybackState::Restored) {
-                    let error = ErrorKind::of_engine(&kind, message.as_deref().unwrap_or(""));
-                    let msg = match message {
-                        Some(m) => format!("{kind}: {m}"),
-                        None => kind,
-                    };
-                    self.halt(&mut fx);
-                    fx.push(Effect::Emit(PlayerEvent::Error { kind: error, message: msg }));
-                }
-            }
+            Input::AudioError { kind, message } => self.audio_error(kind, message, &mut fx),
             Input::Tick { position, track } => {
                 // Only a loaded track has a position in the engine.
                 if track == self.track_seq && matches!(self.state, PlaybackState::Playing | PlaybackState::Paused) {
@@ -571,6 +579,31 @@ impl Core {
             }));
         }
         fx
+    }
+
+    /// An engine error: an expired stream is reloaded once, anything else
+    /// stops playback and is reported.
+    fn audio_error(&mut self, kind: String, message: Option<String>, fx: &mut Vec<Effect>) {
+        // Restored: nothing is loaded, so the error isn't this queue's.
+        if matches!(self.state, PlaybackState::Stopped | PlaybackState::Restored) {
+            return;
+        }
+        let text = message.as_deref().unwrap_or("");
+        if matches!(self.state, PlaybackState::Playing | PlaybackState::Paused)
+            && expired_url(text)
+            && self.reloaded_at.is_none_or(|t| self.now - t >= RELOAD_MEMO_SECS)
+        {
+            log::warn!("[player] the stream answered 403 (its URLs expired?): reloading at {:.1} s", self.position);
+            self.reloaded_at = Some(self.now);
+            return self.reload(fx);
+        }
+        let error = ErrorKind::of_engine(&kind, text);
+        let msg = match message {
+            Some(m) => format!("{kind}: {m}"),
+            None => kind,
+        };
+        self.halt(fx);
+        fx.push(Effect::Emit(PlayerEvent::Error { kind: error, message: msg }));
     }
 
     /// In bit-perfect mode, the engine's error for a rate the device lacks.
@@ -633,6 +666,7 @@ impl Core {
             PlayerCommand::Pause => {
                 if self.state == PlaybackState::Playing {
                     fx.push(Effect::Pause);
+                    self.paused_at = Some(self.now);
                     self.set_state(PlaybackState::Paused, fx);
                 }
             }
@@ -957,8 +991,14 @@ impl Core {
     fn resume(&mut self, fx: &mut Vec<Effect>) {
         match self.state {
             PlaybackState::Paused => {
-                fx.push(Effect::Resume);
-                self.set_state(PlaybackState::Playing, fx);
+                let paused_for = self.paused_at.map_or(0.0, |t| self.now - t);
+                if paused_for >= self.config.reload_after_pause {
+                    log::info!("[player] resuming after {paused_for:.0} s paused: reloading at {:.1} s", self.position);
+                    self.reload(fx);
+                } else {
+                    fx.push(Effect::Resume);
+                    self.set_state(PlaybackState::Playing, fx);
+                }
             }
             PlaybackState::Stopped => {
                 if let Some(item) = self.queue.current().cloned() {
@@ -967,15 +1007,29 @@ impl Core {
             }
             PlaybackState::Restored => {
                 if let Some(item) = self.queue.current().cloned() {
-                    let at = self.position;
-                    self.start_load(item, Transition::Start, fx);
-                    if let Some(loading) = self.loading.as_mut() {
-                        loading.start_at = (at > 0.0).then_some(at);
-                        loading.restored_at = Some(at);
-                    }
+                    self.load_at(item, self.position, Transition::Start, fx);
                 }
             }
             PlaybackState::Playing | PlaybackState::Loading => {}
+        }
+    }
+
+    /// Resolve the current track again and play it from where it is, with
+    /// fresh stream URLs.
+    fn reload(&mut self, fx: &mut Vec<Effect>) {
+        match self.queue.current().cloned() {
+            Some(item) => self.load_at(item, self.position, Transition::Reload, fx),
+            None => self.stop(fx),
+        }
+    }
+
+    /// `start_load` from `at` seconds. If the load fails or is cancelled,
+    /// the entry goes `Restored` at `at`.
+    fn load_at(&mut self, item: QueueItem, at: f64, via: Transition, fx: &mut Vec<Effect>) {
+        self.start_load(item, via, fx);
+        if let Some(loading) = self.loading.as_mut() {
+            loading.start_at = (at > 0.0).then_some(at);
+            loading.restored_at = Some(at);
         }
     }
 
@@ -1430,6 +1484,12 @@ impl Core {
             Advance::End => self.queue_ended(Transition::AfterEnd, fx),
         }
     }
+}
+
+/// An engine error from a stream URL TIDAL no longer honours (GStreamer's
+/// souphttpsrc: "Forbidden (403), URL: …").
+fn expired_url(message: &str) -> bool {
+    message.contains("(403)")
 }
 
 /// The qid a repeat pass of `qid` is armed under; `seq` is the
@@ -1962,6 +2022,97 @@ mod tests {
         let fx = h.cmd(PlayerCommand::Resume);
         assert!(has(&fx, &Effect::Resume));
         assert_eq!(h.core.state(), PlaybackState::Playing);
+    }
+
+    /// The engine's error for an expired segment URL.
+    fn forbidden() -> Input {
+        Input::AudioError {
+            kind: "playback_error".into(),
+            message: Some("Forbidden: gst_soup_http_src_parse_status (): Forbidden (403), URL: https://x/y".into()),
+        }
+    }
+
+    /// The Resolve in `fx` for the current track, answered; returns `Play`'s start.
+    fn reloaded_from(h: &mut Harness, fx: &[Effect]) -> Option<f64> {
+        let (load, item) = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::Resolve { load, item, .. } => Some((*load, item.clone())),
+                _ => None,
+            })
+            .expect("resolves the track again");
+        assert_eq!(item.track_id, h.current());
+        let fx = h.send(Input::PlayResolved { load, result: Ok(resolved("again", 200.0)) });
+        let start = fx.iter().find_map(|e| match e {
+            Effect::Play { start, .. } => Some(*start),
+            _ => None,
+        });
+        let fx = h.send(Input::PlayStarted { load, result: Ok(()) });
+        assert_eq!(started(&fx).map(|(_, via)| via), Some(Transition::Reload));
+        start.expect("a Play")
+    }
+
+    #[test]
+    fn a_long_pause_reloads_the_track_where_it_was() {
+        let mut h = Harness::new();
+        h.load(&[1, 2], RepeatMode::Off, false);
+        h.send(Input::Tick { position: 120.0, track: h.core.track_seq() });
+        h.cmd(PlayerCommand::Pause);
+        h.now += 599.0;
+        let fx = h.cmd(PlayerCommand::Resume);
+        assert!(has(&fx, &Effect::Resume), "a short pause just resumes");
+        h.cmd(PlayerCommand::Pause);
+        h.now += 600.0;
+        let fx = h.cmd(PlayerCommand::TogglePause);
+        assert!(!has(&fx, &Effect::Resume));
+        assert_eq!(h.core.state(), PlaybackState::Loading);
+        assert_eq!(h.core.saved_position(), 120.0, "a quit while reloading keeps the position");
+        assert_eq!(reloaded_from(&mut h, &fx), Some(120.0));
+        assert_eq!(h.core.state(), PlaybackState::Playing);
+        assert_eq!(h.current(), 1);
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_place() {
+        let mut h = Harness::new();
+        h.load(&[1, 2], RepeatMode::Off, false);
+        h.send(Input::Tick { position: 120.0, track: h.core.track_seq() });
+        h.cmd(PlayerCommand::Pause);
+        h.now += 3600.0;
+        let fx = h.cmd(PlayerCommand::Resume);
+        let (load, _) = fx.iter().find_map(|e| match e {
+            Effect::Resolve { load, item, .. } => Some((*load, item.clone())),
+            _ => None,
+        }).unwrap();
+        let fx = h.send(Input::PlayResolved {
+            load,
+            result: Err(ResolveError { message: "offline".into(), kind: ErrorKind::Network }),
+        });
+        assert_eq!(errors(&fx), [ErrorKind::Network]);
+        assert_eq!(h.core.state(), PlaybackState::Restored);
+        assert_eq!(h.core.saved_position(), 120.0);
+    }
+
+    #[test]
+    fn an_expired_stream_is_reloaded_once() {
+        let mut h = Harness::new();
+        h.load(&[1, 2], RepeatMode::Off, false);
+        h.send(Input::Tick { position: 80.0, track: h.core.track_seq() });
+        let fx = h.send(forbidden());
+        assert!(errors(&fx).is_empty(), "no error shown");
+        assert_eq!(reloaded_from(&mut h, &fx), Some(80.0));
+        // Still forbidden with fresh URLs: stop.
+        h.send(Input::Tick { position: 85.0, track: h.core.track_seq() });
+        let fx = h.send(forbidden());
+        assert_eq!(errors(&fx), [ErrorKind::Other]);
+        assert_eq!(h.core.state(), PlaybackState::Stopped);
+        // Much later, another expiry is reloaded again.
+        let fx = h.cmd(PlayerCommand::Resume);
+        h.finish_load(&fx, 200.0);
+        h.now += RELOAD_MEMO_SECS;
+        let fx = h.send(forbidden());
+        assert!(errors(&fx).is_empty());
+        assert_eq!(h.core.state(), PlaybackState::Loading);
     }
 
     /// A bit-perfect player on a 48 kHz-only device (the target laptop).
@@ -2516,6 +2667,8 @@ mod tests {
         assert_eq!(ErrorKind::of_engine("device_disconnected", ""), ErrorKind::Device);
         assert_eq!(ErrorKind::of_engine("", &unsupported_rate_error(96000)), ErrorKind::UnsupportedRate);
         assert_eq!(ErrorKind::of_engine("playback_error", "internal data stream error"), ErrorKind::Other);
+        assert!(expired_url("Forbidden (403), URL: https://sp-ad-cf.audio.tidal.com/x"));
+        assert!(!expired_url("Not Found (404), URL: https://x"));
     }
 
     /// Arm the resolving slot in `fx` and return its qid.
