@@ -3,6 +3,6 @@ resolver = "3"
 members = ["crates/tidal", "crates/engine", "crates/player", "crates/cli", "crates/plugins/api", "crates/plugins/cast", "app"]
 
 [workspace.package]
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "GPL-3.0-only"
