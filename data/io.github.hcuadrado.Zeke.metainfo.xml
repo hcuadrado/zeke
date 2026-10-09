@@ -59,6 +59,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.4.0" date="2026-10-09">
+      <description>
+        <p>
+          Upcoming tracks can be removed from the queue: each one has a
+          remove button in the queue list. The track playing and the
+          ones already played stay.
+        </p>
+      </description>
+    </release>
     <release version="0.3.3" date="2026-10-09">
       <description>
         <p>

@@ -23,6 +23,21 @@ impl ZekeWindow {
         imp.queue_view.set_model(Some(&gtk::NoSelection::new(Some(store.clone()))));
         imp.queue_view.set_factory(Some(&queue_factory()));
         imp.queue.set(store).expect("set once");
+        // Puts back what GTK changes while `show_queue` holds the list still.
+        if let Some(adj) = imp.queue_view.vadjustment() {
+            adj.connect_value_changed(glib::clone!(
+                #[weak(rename_to = window)]
+                self,
+                move |adj| {
+                    let Some((value, until)) = window.imp().queue_hold.get() else { return };
+                    // Clamped: a removal near the end shortens the list.
+                    let value = value.min(adj.upper() - adj.page_size()).max(0.0);
+                    if Instant::now() < until && adj.value() != value {
+                        adj.set_value(value);
+                    }
+                }
+            ));
+        }
 
         for scale in [&*imp.bar_seek, &*imp.sheet_seek] {
             scale.connect_change_value(glib::clone!(
@@ -327,6 +342,21 @@ impl ZekeWindow {
                     })
                 })
                 .collect();
+            // An edit below the current entry (a removal, Play Next, Add to
+            // Queue) leaves the list where it was. GTK re-anchors the view a
+            // frame or two later and can jump to the top when the row it
+            // anchored to goes; the rows above the edit didn't move, so the
+            // old offset is still right (see `setup_player_view`).
+            if at > current
+                && let Some(adj) = imp.queue_view.vadjustment()
+            {
+                let now = Instant::now();
+                let value = match imp.queue_hold.get() {
+                    Some((value, until)) if now < until => value,
+                    _ => adj.value(),
+                };
+                imp.queue_hold.set(Some((value, now + QUEUE_HOLD)));
+            }
             store.splice(at as u32, removed as u32, &rows);
             imp.queue_qids.replace(new.iter().map(|q| q.to_string()).collect());
         }
@@ -402,8 +432,13 @@ fn changed_span(old: &[String], new: &[&str]) -> (usize, usize, usize) {
     (prefix, old.len() - prefix - suffix, new.len() - prefix - suffix)
 }
 
+/// How long the queue list is held still after an edit below the current
+/// entry: GTK re-anchors it within a frame or two.
+const QUEUE_HOLD: Duration = Duration::from_millis(250);
+
 /// Rows: place (or a speaker on the current track), title over artist,
-/// length. Bound with expressions, so metadata arriving later shows up.
+/// length, and a remove button on upcoming entries. Bound with
+/// expressions, so metadata arriving later shows up.
 fn queue_factory() -> gtk::SignalListItemFactory {
     let factory = gtk::SignalListItemFactory::new();
     factory.connect_setup(|_, item| {
@@ -425,6 +460,16 @@ fn queue_factory() -> gtk::SignalListItemFactory {
         row.append(&playing);
         row.append(&text);
         row.append(&length);
+        let remove = gtk::Button::builder()
+            .icon_name("window-close-symbolic")
+            .tooltip_text("Remove from Queue")
+            .valign(gtk::Align::Center)
+            .action_name("win.queue-remove")
+            // Never NULL before bind: Remove("") is a no-op.
+            .action_target(&"".to_variant())
+            .css_classes(["flat", "circular"])
+            .build();
+        row.append(&remove);
         item.set_child(Some(&row));
 
         item.property_expression("position")
@@ -451,6 +496,16 @@ fn queue_factory() -> gtk::SignalListItemFactory {
             text.bind(label, "tooltip-text", gtk::Widget::NONE);
         }
         row_item.chain_property::<QueueRow>("length").bind(&length, "label", gtk::Widget::NONE);
+        row_item
+            .chain_property::<QueueRow>("qid")
+            .chain_closure::<glib::Variant>(glib::closure!(|_: Option<glib::Object>, qid: String| qid.to_variant()))
+            .bind(&remove, "action-target", gtk::Widget::NONE);
+        // Only upcoming entries: the current track and history stay.
+        gtk::ClosureExpression::new::<bool>(
+            [current.clone().upcast(), row_item.chain_property::<QueueRow>("past").upcast()],
+            glib::closure!(|_: Option<glib::Object>, c: bool, p: bool| !c && !p),
+        )
+        .bind(&remove, "visible", gtk::Widget::NONE);
         row_item
             .chain_property::<QueueRow>("past")
             .chain_closure::<Vec<String>>(glib::closure!(|_: Option<glib::Object>, p: bool| {
