@@ -13,6 +13,7 @@ use gtk::{gio, glib, CompositeTemplate};
 use zeke_engine::SignalPath;
 use zeke_player::{PlayerCommand, RepeatMode, StreamFormat};
 use zeke_tidal::commands::auth::PkceAuthParams;
+use zeke_tidal::PlaylistSort;
 
 use crate::session::{Session, TrackMeta, UiEvent};
 
@@ -280,6 +281,17 @@ impl ZekeWindow {
                 }
             })
             .build();
+        // The library's sort menu: radio items with TIDAL's `order` as the
+        // target; the state follows the saved sort (`sync_playlist_sort`).
+        let playlist_sort = gio::ActionEntry::builder("playlist-sort")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .state(PlaylistSort::default().order().to_variant())
+            .activate(|w: &Self, _, order| {
+                if let Some(order) = order.and_then(|o| o.get::<String>()) {
+                    w.set_playlist_sort(PlaylistSort::from_order(&order));
+                }
+            })
+            .build();
         self.add_action_entries([
             simple("play-pause", |w| w.send(PlayerCommand::TogglePause)),
             simple("next", |w| w.send(PlayerCommand::Next)),
@@ -294,6 +306,7 @@ impl ZekeWindow {
             }),
             shuffle,
             queue_remove,
+            playlist_sort,
             simple("logout", Self::logout),
             simple("preferences", crate::preferences::ZekePreferences::present),
             simple("search", Self::focus_search),

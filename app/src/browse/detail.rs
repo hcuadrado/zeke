@@ -81,7 +81,7 @@ fn minutes(secs: u32) -> String {
     }
 }
 
-fn count(n: usize) -> String {
+pub(super) fn count(n: usize) -> String {
     format!("{n} track{}", if n == 1 { "" } else { "s" })
 }
 
