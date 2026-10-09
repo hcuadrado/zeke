@@ -16,9 +16,9 @@ use crate::cache::{CacheResult, CacheTier};
 use crate::client_lock::{self, Caller, ClientGuard};
 use crate::tidal_api::{
     AllFavoriteIds, AlbumPageResponse, MixPageResult, PaginatedResponse, PaginatedTracks, TidalAlbumDetail, TidalArtistDetail,
-    TidalClient, TidalPlaylist, TidalSearchResults,
+    TidalClient, TidalPlaylist, TidalPlaylistRaw, TidalSearchResults,
 };
-use crate::{AppState, TidalError};
+use crate::{AppState, PlaylistSort, TidalError};
 
 /// TIDAL's largest page for playlist and favorite-track items.
 pub const TRACK_PAGE: u32 = 100;
@@ -177,39 +177,100 @@ pub async fn favorite_artists(
     client(state, "favorite artists").await.get_favorite_artists(user, offset, limit, "DATE", "DESC").await
 }
 
-/// The user's own playlists, then the ones they favorited, without
-/// duplicates: TIDAL's "My Collection → Playlists". Both lists are short,
-/// so they are read whole, one request per page.
-pub async fn my_playlists(state: &AppState) -> Result<Vec<TidalPlaylist>, TidalError> {
+/// Who a library playlist belongs to, as the list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlaylistOwner {
+    You,
+    Tidal,
+    Creator(String),
+    /// Someone else's, and TIDAL doesn't say whose.
+    Unknown,
+}
+
+/// One row of a level of the playlist library.
+#[derive(Debug, Clone)]
+pub enum LibraryEntry {
+    Folder {
+        /// The id without its `trn:folder:` prefix.
+        id: String,
+        name: String,
+        /// How many playlists it holds, when TIDAL says.
+        count: Option<u32>,
+    },
+    Playlist { playlist: TidalPlaylist, owner: PlaylistOwner },
+}
+
+/// A level of the user's playlist library (`root`, or a folder's id): the
+/// playlists they made and the ones they favorited, with the folders they
+/// arranged them in, sorted as `sort` says. Read whole, following the
+/// cursor (the total is not reliable), one request per page. The cursor
+/// names the last entry read and TIDAL ignores `offset` next to it, so
+/// every request sends 0.
+pub async fn playlist_folder(state: &AppState, folder: &str, sort: PlaylistSort) -> Result<Vec<LibraryEntry>, TidalError> {
     const PAGE: u32 = 50;
-    const MAX: u32 = 1000;
+    const MAX_PAGES: u32 = 20;
     let user = user_id(state).await?;
-    let mut out: Vec<TidalPlaylist> = Vec::new();
-    let mut offset = 0;
-    while offset < MAX {
-        let page = client(state, "own playlists").await.get_user_playlists(user, offset, PAGE).await?;
-        let n = page.items.len() as u32;
-        out.extend(page.items);
-        offset += n;
-        if n == 0 || offset >= page.total_number_of_items {
-            break;
+    let mut out = Vec::new();
+    let mut cursor = String::new();
+    for _ in 0..MAX_PAGES {
+        let raw = client(state, "playlist folder")
+            .await
+            .get_playlist_folders(folder, "", 0, PAGE, sort.order(), sort.direction(), &cursor)
+            .await?;
+        parse_folder_page(&raw, user, &mut out);
+        match next_cursor(&raw) {
+            Some(next) => cursor = next,
+            None => return Ok(out),
         }
     }
-    let mut offset = 0;
-    while offset < MAX {
-        let page = client(state, "favorite playlists").await.get_favorite_playlists(user, offset, PAGE).await?;
-        let n = page.items.len() as u32;
-        for p in page.items {
-            if !out.iter().any(|o| o.uuid == p.uuid) {
-                out.push(p);
-            }
-        }
-        offset += n;
-        if n == 0 || offset >= page.total_number_of_items {
-            break;
-        }
-    }
+    log::warn!("[browse] playlist folder {folder}: more than {} entries, the rest left out", out.len());
     Ok(out)
+}
+
+/// The cursor of the page after `page`: none on the last one, where TIDAL
+/// leaves it out (or sends it null or empty).
+fn next_cursor(page: &Value) -> Option<String> {
+    page["cursor"].as_str().filter(|c| !c.is_empty()).map(str::to_string)
+}
+
+/// Add a page of the folders endpoint to `out`, following Sone's
+/// `normalizeFolderItem`. A playlist that doesn't parse is left out.
+fn parse_folder_page(json: &Value, user: u64, out: &mut Vec<LibraryEntry>) {
+    for item in json["items"].as_array().map(Vec::as_slice).unwrap_or_default() {
+        if item["itemType"] == "FOLDER" {
+            // Without its id a folder can't be opened.
+            let Some(trn) = item["trn"].as_str().filter(|t| !t.is_empty()) else {
+                log::warn!("[browse] a library folder has no id; left out");
+                continue;
+            };
+            out.push(LibraryEntry::Folder {
+                id: trn.strip_prefix("trn:folder:").unwrap_or(trn).to_string(),
+                name: item["name"].as_str().unwrap_or("").to_string(),
+                count: item["data"]["totalNumberOfItems"].as_u64().map(|n| n as u32),
+            });
+            continue;
+        }
+        match serde_json::from_value::<TidalPlaylistRaw>(item["data"].clone()) {
+            Ok(raw) => {
+                let playlist = TidalPlaylist::from(raw);
+                let owner = playlist_owner(&playlist, user);
+                out.push(LibraryEntry::Playlist { playlist, owner });
+            }
+            Err(e) => log::warn!("[browse] a library playlist didn't parse: {e}"),
+        }
+    }
+}
+
+fn playlist_owner(playlist: &TidalPlaylist, user: u64) -> PlaylistOwner {
+    let creator = playlist.creator.as_ref();
+    match creator.and_then(|c| c.id) {
+        Some(id) if id == user => PlaylistOwner::You,
+        Some(0) => PlaylistOwner::Tidal,
+        _ => match creator.and_then(|c| c.name.clone()).filter(|n| !n.is_empty()) {
+            Some(name) => PlaylistOwner::Creator(name),
+            None => PlaylistOwner::Unknown,
+        },
+    }
 }
 
 /// Something the user can add to their favorites ("My Collection").
@@ -479,5 +540,67 @@ mod tests {
         assert_eq!(page.sections[0].title, "Popular tracks");
         assert_eq!(page.sections[0].view_all, None, "v1 paths aren't v2 view-all pages");
         assert_eq!(page.sections[1].section_type, "ALBUM_LIST");
+    }
+
+    fn library_playlist(uuid: &str, title: &str, creator: serde_json::Value) -> serde_json::Value {
+        json!({"itemType": "PLAYLIST", "data": {"uuid": uuid, "title": title, "numberOfTracks": 12,
+            "squareImage": "img", "creator": creator}})
+    }
+
+    #[test]
+    fn a_library_level_has_folders_and_playlists_with_their_owners() {
+        let page = json!({"cursor": null, "items": [
+            {"itemType": "FOLDER", "name": "Rock", "trn": "trn:folder:f-1", "data": {"totalNumberOfItems": 3}},
+            {"itemType": "FOLDER", "name": "New", "trn": "trn:folder:f-2", "data": {}},
+            library_playlist("p-own", "Mine", json!({"id": 42, "name": null, "type": "USER"})),
+            library_playlist("p-other", "Theirs", json!({"id": 7, "name": "Ana", "type": "USER"})),
+            library_playlist("p-tidal", "Editorial", json!({"id": 0, "name": null, "type": "TIDAL"})),
+            library_playlist("p-anon", "Nameless", json!({"id": 9})),
+            {"itemType": "PLAYLIST", "data": {"title": "no uuid"}}
+        ]});
+        let mut out = Vec::new();
+        parse_folder_page(&page, 42, &mut out);
+        assert_eq!(out.len(), 6, "the playlist that doesn't parse is left out");
+        let folder = |i: usize| match &out[i] {
+            LibraryEntry::Folder { id, name, count } => (id.clone(), name.clone(), *count),
+            other => panic!("{other:?} is not a folder"),
+        };
+        assert_eq!(folder(0), ("f-1".into(), "Rock".into(), Some(3)));
+        assert_eq!(folder(1), ("f-2".into(), "New".into(), None), "a missing count stays missing");
+        let owner = |i: usize| match &out[i] {
+            LibraryEntry::Playlist { playlist, owner } => (playlist.uuid.clone(), owner.clone()),
+            other => panic!("{other:?} is not a playlist"),
+        };
+        assert_eq!(owner(2), ("p-own".into(), PlaylistOwner::You));
+        assert_eq!(owner(3), ("p-other".into(), PlaylistOwner::Creator("Ana".into())));
+        assert_eq!(owner(4), ("p-tidal".into(), PlaylistOwner::Tidal));
+        assert_eq!(owner(5), ("p-anon".into(), PlaylistOwner::Unknown));
+        match &out[2] {
+            LibraryEntry::Playlist { playlist, .. } => {
+                assert_eq!(playlist.title, "Mine");
+                assert_eq!(playlist.number_of_tracks, Some(12));
+                assert_eq!(playlist.image.as_deref(), Some("img"));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn an_empty_or_odd_page_adds_nothing() {
+        let mut out = Vec::new();
+        parse_folder_page(&json!({"items": []}), 1, &mut out);
+        parse_folder_page(&json!({}), 1, &mut out);
+        // A folder without its id can't be opened.
+        parse_folder_page(&json!({"items": [{"itemType": "FOLDER", "name": "No id"}]}), 1, &mut out);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn the_last_page_has_no_cursor() {
+        assert_eq!(next_cursor(&json!({"items": [], "cursor": "eyJpZCI6IjEifQ"})).as_deref(), Some("eyJpZCI6IjEifQ"));
+        // A single page: TIDAL leaves the key out.
+        assert_eq!(next_cursor(&json!({"items": []})), None);
+        assert_eq!(next_cursor(&json!({"cursor": null})), None);
+        assert_eq!(next_cursor(&json!({"cursor": ""})), None);
     }
 }

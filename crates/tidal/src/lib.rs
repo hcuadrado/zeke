@@ -81,6 +81,52 @@ pub enum ColorScheme {
     Dark,
 }
 
+/// How the playlist library is sorted: the folders endpoint's `order`,
+/// each with its own direction (the dates newest first, the name A to Z).
+/// Stored as the endpoint's string; an unknown one (a newer or older
+/// build wrote it) reads as the default, so the settings still load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlaylistSort {
+    #[default]
+    LastUpdated,
+    DateAdded,
+    Name,
+}
+
+impl PlaylistSort {
+    pub const ALL: [PlaylistSort; 3] = [PlaylistSort::LastUpdated, PlaylistSort::DateAdded, PlaylistSort::Name];
+
+    pub fn order(self) -> &'static str {
+        match self {
+            PlaylistSort::LastUpdated => "DATE_UPDATED",
+            PlaylistSort::DateAdded => "DATE",
+            PlaylistSort::Name => "NAME",
+        }
+    }
+
+    pub fn direction(self) -> &'static str {
+        if self == PlaylistSort::Name { "ASC" } else { "DESC" }
+    }
+
+    /// The sort for an `order` string; the default for an unknown one.
+    pub fn from_order(order: &str) -> Self {
+        Self::ALL.into_iter().find(|s| s.order() == order).unwrap_or_default()
+    }
+}
+
+impl Serialize for PlaylistSort {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(self.order())
+    }
+}
+
+impl<'de> Deserialize<'de> for PlaylistSort {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        Ok(v.as_str().map(Self::from_order).unwrap_or_default())
+    }
+}
+
 /// The settings.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Settings {
@@ -118,6 +164,8 @@ pub struct Settings {
     pub proxy: ProxySettings,
     #[serde(default)]
     pub color_scheme: ColorScheme,
+    #[serde(default)]
+    pub playlist_sort: PlaylistSort,
     /// Each plugin's own entry, keyed by plugin id, in whatever shape the
     /// plugin gives it. Opaque here, and kept whole by every save, so an
     /// entry survives a build without its plugin and a token refresh.
@@ -141,6 +189,7 @@ impl Default for Settings {
             volume_normalization: false,
             proxy: Default::default(),
             color_scheme: ColorScheme::System,
+            playlist_sort: PlaylistSort::LastUpdated,
             plugins: BTreeMap::new(),
         }
     }
@@ -338,6 +387,7 @@ mod settings_tests {
             assert_eq!(s.max_quality, "HI_RES_LOSSLESS");
             assert_eq!(s.auth_method, AuthMethod::LoginCode);
             assert_eq!(s.color_scheme, ColorScheme::System);
+            assert_eq!(s.playlist_sort, PlaylistSort::LastUpdated);
         }
     }
 
@@ -379,6 +429,29 @@ mod settings_tests {
         assert_eq!(v["color_scheme"], "dark");
         let back: Settings = serde_json::from_value(v).unwrap();
         assert_eq!(back.color_scheme, ColorScheme::Dark);
+    }
+
+    #[test]
+    fn playlist_sort_is_stored_as_tidals_order() {
+        for sort in PlaylistSort::ALL {
+            let v = serde_json::to_value(Settings { playlist_sort: sort, ..Settings::default() }).unwrap();
+            assert_eq!(v["playlist_sort"], sort.order());
+            let back: Settings = serde_json::from_value(v).unwrap();
+            assert_eq!(back.playlist_sort, sort);
+        }
+        assert_eq!(PlaylistSort::Name.direction(), "ASC");
+        assert_eq!(PlaylistSort::DateAdded.direction(), "DESC");
+        assert_eq!(PlaylistSort::LastUpdated.direction(), "DESC");
+    }
+
+    #[test]
+    fn an_unknown_playlist_sort_reads_as_the_default() {
+        let mut v = serde_json::to_value(Settings::default()).unwrap();
+        for bad in [serde_json::json!("POPULARITY"), serde_json::json!(""), serde_json::json!(7), serde_json::Value::Null] {
+            v["playlist_sort"] = bad;
+            let s: Settings = serde_json::from_value(v.clone()).unwrap();
+            assert_eq!(s.playlist_sort, PlaylistSort::LastUpdated);
+        }
     }
 
     #[test]

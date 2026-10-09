@@ -59,6 +59,17 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.0" date="2026-10-09">
+      <description>
+        <p>
+          Favorites → Playlists now follows your TIDAL library: Loved
+          Tracks first, then your folders, then your playlists, with who
+          made each one and how many tracks it has. Open a folder to see
+          what is in it, and sort by last updated, date added or name.
+          Folders are read only for now.
+        </p>
+      </description>
+    </release>
     <release version="0.4.0" date="2026-10-09">
       <description>
         <p>

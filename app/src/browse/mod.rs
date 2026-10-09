@@ -10,6 +10,7 @@ mod artist;
 mod detail;
 mod favorites;
 mod home;
+mod library;
 pub mod model;
 mod search;
 pub mod views;
@@ -80,6 +81,8 @@ pub enum Target {
     ViewAll { title: String, api_path: String },
     /// An artist section's "view all" (v2 `artist/…/view-all`).
     ArtistViewAll { title: String, artist: u64, path: String, tracks: bool },
+    /// A folder of the playlist library (its id and name).
+    PlaylistFolder { id: String, name: String },
 }
 
 mod page_imp {
@@ -324,6 +327,7 @@ impl ZekeWindow {
     /// Signed in: Home is the start page.
     pub fn start_browsing(&self) {
         self.imp().roots.borrow_mut().clear();
+        self.sync_playlist_sort();
         self.show_root(Root::Home);
         self.load_favorites();
     }
@@ -358,7 +362,7 @@ impl ZekeWindow {
                     Root::FavoriteTracks => detail::favorite_tracks(self),
                     Root::FavoriteAlbums => favorites::albums(self),
                     Root::FavoriteArtists => favorites::artists(self),
-                    Root::FavoritePlaylists => favorites::playlists(self),
+                    Root::FavoritePlaylists => library::page(self, None),
                 };
                 let p = p.upcast::<adw::NavigationPage>();
                 p.set_tag(Some(root.name()));
@@ -386,6 +390,7 @@ impl ZekeWindow {
             Target::Artist(id) => artist::page(self, id),
             Target::ViewAll { title, api_path } => home::view_all(self, title, api_path),
             Target::ArtistViewAll { title, artist, path, tracks } => artist::view_all(self, title, artist, path, tracks),
+            Target::PlaylistFolder { id, name } => library::page(self, Some((id, name))),
         };
         self.imp().nav_view.push(&page);
     }

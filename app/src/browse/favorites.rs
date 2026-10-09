@@ -1,4 +1,4 @@
-//! Card grids: favorite albums, artists and playlists, and an artist
+//! Card grids: favorite albums and artists, and an artist
 //! section's cards ("view all"). Newest first; more load at the bottom.
 
 use std::cell::Cell;
@@ -22,7 +22,6 @@ const PAGE: u32 = 50;
 enum Source {
     Albums,
     Artists,
-    Playlists,
     ArtistViewAll { artist: u64, path: String },
 }
 
@@ -39,10 +38,6 @@ async fn fetch(state: Arc<AppState>, source: Source, offset: u32) -> Result<(Vec
             let page = browse::favorite_artists(&state, offset, PAGE).await?;
             let next = more(page.items.len() as u32, page.total_number_of_items);
             Ok((page.items.iter().filter_map(|a| CardData::from_typed(a, "ARTIST")).collect(), next))
-        }
-        Source::Playlists => {
-            let list = browse::my_playlists(&state).await?;
-            Ok((list.iter().filter_map(|p| CardData::from_typed(p, "PLAYLIST")).collect(), None))
         }
         Source::ArtistViewAll { artist, path } => {
             let items = browse::artist_view_all(&state, artist, &path, offset, PAGE).await?;
@@ -150,10 +145,6 @@ pub fn albums(window: &ZekeWindow) -> BrowsePage {
 
 pub fn artists(window: &ZekeWindow) -> BrowsePage {
     open(window, "Artists", Source::Artists, ("No Favorite Artists", "Artists you follow in TIDAL show up here."))
-}
-
-pub fn playlists(window: &ZekeWindow) -> BrowsePage {
-    open(window, "Playlists", Source::Playlists, ("No Playlists", "Your playlists and the ones you add show up here."))
 }
 
 pub fn artist_cards(window: &ZekeWindow, title: &str, artist: u64, path: String) -> BrowsePage {

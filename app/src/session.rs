@@ -19,7 +19,7 @@ use zeke_player::{
     QueueItem, RepeatMode, StreamFormat, TrackInfo, Transition, Update,
 };
 use zeke_tidal::client_lock::{self, Caller};
-use zeke_tidal::{AppState, ColorScheme, Settings, TidalError};
+use zeke_tidal::{AppState, ColorScheme, PlaylistSort, Settings, TidalError};
 
 use crate::mpris::{MprisCommand, MprisHandle};
 use crate::runtime::runtime;
@@ -226,6 +226,12 @@ impl Session {
     pub fn set_color_scheme(&self, scheme: ColorScheme) {
         if self.settings.borrow().color_scheme != scheme {
             self.change_settings(move |s| s.color_scheme = scheme);
+        }
+    }
+
+    pub fn set_playlist_sort(&self, sort: PlaylistSort) {
+        if self.settings.borrow().playlist_sort != sort {
+            self.change_settings(move |s| s.playlist_sort = sort);
         }
     }
 
