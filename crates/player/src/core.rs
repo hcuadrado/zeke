@@ -210,8 +210,8 @@ pub enum PlayerCommand {
     },
     Append(Vec<QueueTrack>),
     PlayNext(QueueTrack),
-    /// Remove the n-th upcoming track (0 = the next one).
-    RemoveUpcoming(usize),
+    /// Remove the upcoming entry with this qid.
+    Remove(String),
     /// Replace the queue with a saved one, `Restored` at its saved position:
     /// nothing is resolved or played until `Resume`.
     Restore(Box<PersistedQueue>),
@@ -443,6 +443,10 @@ pub struct Core {
     /// Generation of prefetches.
     prefetch_gen: u64,
     prefetch: Option<Prefetch>,
+    /// The entry last removed while it was armed: the engine may have
+    /// switched to it already, so `track_advanced` puts it back whole. A
+    /// new pipeline (load, stop) drops it.
+    removed_in_window: Option<QueueItem>,
     /// The last failed prefetch: (qid, retry after).
     failed: Option<(String, f64)>,
     consecutive_fails: u32,
@@ -489,6 +493,7 @@ impl Core {
             loading: None,
             prefetch_gen: 0,
             prefetch: None,
+            removed_in_window: None,
             failed: None,
             consecutive_fails: 0,
             track_seq: 0,
@@ -788,8 +793,17 @@ impl Core {
                 self.play_pick_if_waiting(fx);
                 self.maybe_prefetch(fx);
             }
-            PlayerCommand::RemoveUpcoming(n) => {
-                self.queue.remove_upcoming(n);
+            PlayerCommand::Remove(qid) => {
+                if let Some(removed) = self.queue.remove(&qid)
+                    && self
+                        .prefetch
+                        .as_ref()
+                        .is_some_and(|p| p.item.qid == removed.qid && matches!(p.slot, Slot::Armed(_)))
+                {
+                    // Only an armed slot can be switched to; anything else
+                    // removed later must not push this one out.
+                    self.removed_in_window = Some(removed);
+                }
                 self.maybe_prefetch(fx);
             }
             PlayerCommand::SetNormalization(on) => {
@@ -1037,6 +1051,7 @@ impl Core {
         self.load += 1;
         self.radio = None;
         self.waiting = None;
+        self.removed_in_window = None;
         // Whatever was armed belongs to the track being replaced.
         self.clear_prefetch("a new track is loading", fx);
         self.loading = Some(Loading {
@@ -1063,6 +1078,7 @@ impl Core {
         self.loading = None;
         self.radio = None;
         self.waiting = None;
+        self.removed_in_window = None;
         self.clear_prefetch("stopped", fx);
         fx.push(Effect::Stop);
         self.position = 0.0;
@@ -1087,6 +1103,7 @@ impl Core {
         self.loading = None;
         self.radio = None;
         self.waiting = None;
+        self.removed_in_window = None;
         self.clear_prefetch("stopped", fx);
         // Releases whatever the failed start opened.
         fx.push(Effect::Stop);
@@ -1393,6 +1410,7 @@ impl Core {
             log::debug!("[player] ignoring track-advanced to {track_id} while {:?}", self.state);
             return;
         }
+        let removed = self.removed_in_window.take().filter(|r| r.qid == qid);
         let slot = self.prefetch.take();
         let armed = match &slot {
             Some(Prefetch { item, slot: Slot::Armed(r) }) if item.qid == qid => Some(r.clone()),
@@ -1412,7 +1430,10 @@ impl Core {
             (self.queue.wrap_to(&qid).expect("the entry is in the queue"), Transition::Wrap)
         } else {
             log::warn!("[player] track-advanced to {track_id} ({qid}), which left the queue; re-adding it");
-            self.queue.play_next(track_id);
+            match removed {
+                Some(item) => self.queue.insert_next(item),
+                None => self.queue.play_next(track_id),
+            }
             let next = self.queue.upcoming().next().expect("just inserted").qid.clone();
             (self.queue.advance_to_qid(&next).expect("just inserted"), Transition::Gapless)
         };
@@ -1583,6 +1604,12 @@ mod tests {
 
         fn current(&self) -> u64 {
             self.core.queue().current().unwrap().track_id
+        }
+
+        /// Remove the next upcoming entry, by its qid.
+        fn remove_next(&mut self) -> Vec<Effect> {
+            let qid = self.core.queue().upcoming().next().unwrap().qid.clone();
+            self.cmd(PlayerCommand::Remove(qid))
         }
     }
 
@@ -1802,7 +1829,7 @@ mod tests {
         assert!(has(&fx, &Effect::ClearNext));
         assert_eq!(resolve_next(&fx).unwrap().1.track_id, 9);
         // Removing it rebuilds again, back to track 2.
-        let fx = h.cmd(PlayerCommand::RemoveUpcoming(0));
+        let fx = h.remove_next();
         assert!(!has(&fx, &Effect::ClearNext), "nothing armed yet, only resolving");
         let (pf2, item) = resolve_next(&fx).unwrap();
         assert_eq!(item.track_id, 2);
@@ -1970,6 +1997,85 @@ mod tests {
         assert!(resolve_next(&h.send(Input::Tick { position: 170.0, track: h.core.track_seq() })).is_none());
     }
 
+    /// The engine switched to the armed track while it was being removed:
+    /// it plays on, and the queue gets the entry back as it was.
+    #[test]
+    fn removing_the_armed_track_in_the_switch_window_keeps_it() {
+        let mut h = Harness::new();
+        let info = TrackInfo { title: "Two".into(), duration: Some(180.0), ..TrackInfo::default() };
+        let fx = h.cmd(PlayerCommand::Load {
+            tracks: vec![1.into(), QueueTrack::new(2, info), 3.into()],
+            start: Some(0),
+            album_mode: false,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+        });
+        h.finish_load(&fx, 200.0);
+        let (pf, two) = resolve_next(&h.send(Input::Tick { position: 185.0, track: h.core.track_seq() })).unwrap();
+        h.send(Input::NextResolved { prefetch: pf, result: Ok(resolved("two", 180.0)) });
+        // (concat switches to 2 here; the player doesn't know yet)
+        h.remove_next();
+        assert_eq!(h.core.queue().upcoming().map(|t| t.track_id).collect::<Vec<_>>(), vec![3]);
+        let fx = h.send(Input::TrackAdvanced { track_id: 2, qid: two.qid.clone(), replay_gain: 0.0, peak_amplitude: 1.0 });
+        assert_eq!(started(&fx), Some((2, Transition::Gapless)));
+        let now = h.core.queue().current().unwrap();
+        assert_eq!((now.track_id, now.qid.as_str()), (2, two.qid.as_str()));
+        assert_eq!(now.info.as_ref().unwrap().title, "Two");
+        assert_eq!(h.core.queue().upcoming().map(|t| t.track_id).collect::<Vec<_>>(), vec![3]);
+    }
+
+    #[test]
+    fn a_second_removal_in_the_switch_window_keeps_the_armed_one() {
+        let mut h = Harness::new();
+        let info = TrackInfo { title: "Two".into(), duration: Some(180.0), ..TrackInfo::default() };
+        let fx = h.cmd(PlayerCommand::Load {
+            tracks: vec![1.into(), QueueTrack::new(2, info), 3.into(), 4.into()],
+            start: Some(0),
+            album_mode: false,
+            shuffle: false,
+            repeat: RepeatMode::Off,
+        });
+        h.finish_load(&fx, 200.0);
+        let (pf, two) = resolve_next(&h.send(Input::Tick { position: 185.0, track: h.core.track_seq() })).unwrap();
+        h.send(Input::NextResolved { prefetch: pf, result: Ok(resolved("two", 180.0)) });
+        // 2 is removed after the engine switched; 3, still resolving, goes too.
+        h.remove_next();
+        h.remove_next();
+        let fx = h.send(Input::TrackAdvanced { track_id: 2, qid: two.qid.clone(), replay_gain: 0.0, peak_amplitude: 1.0 });
+        assert_eq!(started(&fx), Some((2, Transition::Gapless)));
+        let now = h.core.queue().current().unwrap();
+        assert_eq!((now.qid.as_str(), now.info.as_ref().unwrap().title.as_str()), (two.qid.as_str(), "Two"));
+        assert_eq!(h.core.queue().upcoming().map(|t| t.track_id).collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn a_removed_track_the_engine_never_switched_to_stays_gone() {
+        let mut h = Harness::new();
+        h.load(&[1, 2, 3], RepeatMode::Off, false);
+        let (pf, _) = resolve_next(&h.send(Input::Tick { position: 185.0, track: h.core.track_seq() })).unwrap();
+        h.send(Input::NextResolved { prefetch: pf, result: Ok(resolved("two", 180.0)) });
+        let fx = h.remove_next();
+        assert!(has(&fx, &Effect::ClearNext));
+        let (pf3, three) = resolve_next(&fx).unwrap();
+        h.send(Input::NextResolved { prefetch: pf3, result: Ok(resolved("three", 180.0)) });
+        let fx = h.send(Input::TrackAdvanced { track_id: 3, qid: three.qid, replay_gain: 0.0, peak_amplitude: 1.0 });
+        assert_eq!(started(&fx), Some((3, Transition::Gapless)));
+        assert_eq!(h.core.queue().upcoming().count(), 0, "2 doesn't come back");
+    }
+
+    #[test]
+    fn removing_the_current_track_or_an_unknown_qid_does_nothing() {
+        let mut h = Harness::new();
+        h.load(&[1, 2, 3], RepeatMode::Off, false);
+        let revision = h.core.queue().revision();
+        let current = h.core.queue().current().unwrap().qid.clone();
+        h.cmd(PlayerCommand::Remove(current));
+        h.cmd(PlayerCommand::Remove(String::new()));
+        h.cmd(PlayerCommand::Remove("nope".into()));
+        assert_eq!(h.core.queue().revision(), revision);
+        assert_eq!(h.core.queue().upcoming().count(), 2);
+    }
+
     #[test]
     fn a_slot_armed_in_the_window_for_another_track_is_cleared() {
         let mut h = Harness::new();
@@ -1979,7 +2085,7 @@ mod tests {
         // In the window: 9 queued and armed, then removed again (3 is armed).
         let (pf9, _) = resolve_next(&h.cmd(PlayerCommand::PlayNext(9.into()))).unwrap();
         h.send(Input::NextResolved { prefetch: pf9, result: Ok(resolved("nine", 100.0)) });
-        h.cmd(PlayerCommand::RemoveUpcoming(0)); // removes 9; 2 is next again
+        h.remove_next(); // removes 9; 2 is next again
         let fx = h.send(Input::TrackAdvanced { track_id: 2, qid: two.qid, replay_gain: 0.0, peak_amplitude: 1.0 });
         assert_eq!(started(&fx), Some((2, Transition::Gapless)));
         assert_eq!(h.core.queue().peek_next().unwrap().item().track_id, 3);
@@ -3282,8 +3388,8 @@ mod tests {
         h.play_at(&[1], 0);
         let (fetch, _) = fetch_radio(&h.tick(130.0)).unwrap();
         h.answer(fetch, &[10, 11]);
-        h.cmd(PlayerCommand::RemoveUpcoming(0));
-        let fx = h.cmd(PlayerCommand::RemoveUpcoming(0));
+        h.remove_next();
+        let fx = h.remove_next();
         assert_eq!(fetch_radio(&fx), None);
         let fx = h.send(Input::TrackFinished);
         assert!(ended(&fx));

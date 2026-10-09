@@ -517,8 +517,14 @@ impl Queue {
 
     /// Play next: right after the current track.
     pub fn play_next(&mut self, track: impl Into<QueueTrack>) {
-        self.revision += 1;
         let item = self.stamp(track.into());
+        self.insert_next(item);
+    }
+
+    /// Put an existing entry (qid, info and origin kept) right after the
+    /// current track.
+    pub fn insert_next(&mut self, item: QueueItem) {
+        self.revision += 1;
         self.items.push(item);
         let index = self.items.len() - 1;
         if self.order.is_empty() {
@@ -529,12 +535,11 @@ impl Queue {
         }
     }
 
-    /// Remove an upcoming track: `n` counts upcoming tracks from 0.
-    pub fn remove_upcoming(&mut self, n: usize) -> Option<QueueItem> {
-        let at = self.pos + 1 + n;
-        if at >= self.order.len() {
-            return None;
-        }
+    /// Remove the upcoming entry `qid`. The current track and history
+    /// stay: `None` for those and for a qid that is gone. The removal is
+    /// permanent: with repeat-all, later passes leave the entry out too.
+    pub fn remove(&mut self, qid: &str) -> Option<QueueItem> {
+        let at = self.pos + 1 + self.upcoming().position(|t| t.qid == qid)?;
         self.revision += 1;
         let index = self.order.remove(at);
         let removed = self.items.remove(index);
@@ -823,8 +828,11 @@ mod tests {
         assert_eq!(q.peek_next().unwrap().item().track_id, 99);
         q.append([40]);
         assert_eq!(ids(q.upcoming().cloned()), vec![99, 20, 30, 40]);
-        assert_eq!(q.remove_upcoming(0).unwrap().track_id, 99);
-        assert_eq!(q.remove_upcoming(9), None);
+        let next = q.upcoming().next().unwrap().qid.clone();
+        assert_eq!(q.remove(&next).unwrap().track_id, 99);
+        assert_eq!(q.remove(&next), None, "already gone");
+        let current = q.current().unwrap().qid.clone();
+        assert_eq!(q.remove(&current), None, "the current track stays");
         assert_eq!(ids(q.upcoming().cloned()), vec![20, 30, 40]);
         assert_eq!(q.current().unwrap().track_id, 10);
         // The same track twice gets two qids, and reconciliation finds the right one.
@@ -835,6 +843,50 @@ mod tests {
         assert_eq!(q.position(), (1, 5));
         assert_eq!(ids(q.upcoming().cloned()), vec![20, 30, 40]);
         assert_eq!(q.advance_to_qid("nope"), None);
+    }
+
+    #[test]
+    fn history_cannot_be_removed() {
+        let mut q = Queue::new(1);
+        q.load([10, 20, 30], Some(0), false);
+        let first = q.current().unwrap().qid.clone();
+        q.advance(true);
+        let revision = q.revision();
+        assert_eq!(q.remove(&first), None, "20 is playing, 10 is history");
+        assert_eq!(q.revision(), revision, "nothing changed, nothing to save");
+        assert_eq!(ids(q.in_order().cloned()), vec![10, 20, 30]);
+    }
+
+    #[test]
+    fn removing_under_shuffle_drops_the_entry_from_both_orders() {
+        let mut q = Queue::new(7);
+        q.load([10, 20, 30, 40, 50], Some(0), true);
+        let gone = q.upcoming().nth(1).unwrap().clone();
+        let before = ids(q.upcoming().cloned());
+        assert_eq!(q.remove(&gone.qid).unwrap().qid, gone.qid);
+        let mut want = before;
+        want.retain(|&id| id != gone.track_id);
+        assert_eq!(ids(q.upcoming().cloned()), want, "the rest keep their shuffled order");
+        let saved = q.to_persisted(0, false);
+        assert_eq!(saved.tracks.len(), 4, "the source order lost it too");
+        assert!(saved.tracks.iter().all(|t| t.id != gone.track_id));
+        let back = Queue::from_persisted(&saved, 1).unwrap();
+        assert_eq!(ids(back.upcoming().cloned()), want);
+    }
+
+    #[test]
+    fn insert_next_keeps_the_entry_whole() {
+        let info = TrackInfo { title: "Two".into(), duration: Some(180.0), ..TrackInfo::default() };
+        let mut q = Queue::new(3);
+        q.load([1.into(), QueueTrack::new(2, info), 3.into()], Some(0), false);
+        let next = q.upcoming().next().unwrap().qid.clone();
+        let two = q.remove(&next).unwrap();
+        q.insert_next(two.clone());
+        let back = q.upcoming().next().unwrap();
+        assert_eq!((back.qid.as_str(), back.track_id, back.origin), (two.qid.as_str(), 2, two.origin));
+        assert_eq!(back.info.as_ref().unwrap().title, "Two");
+        assert_eq!(ids(q.upcoming().cloned()), vec![2, 3]);
+        assert_eq!(q.current().unwrap().track_id, 1);
     }
 
     #[test]

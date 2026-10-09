@@ -135,6 +135,8 @@ mod imp {
         /// The qids in `queue`, in order, and the row marked current.
         pub queue_qids: RefCell<Vec<String>>,
         pub queue_current: glib::WeakRef<crate::queue_row::QueueRow>,
+        /// The queue's scroll offset to keep, and until when (see `show_queue`).
+        pub queue_hold: Cell<Option<(f64, std::time::Instant)>>,
         pub now: RefCell<Option<Now>>,
         pub signal_path: RefCell<Option<Box<SignalPath>>>,
         pub metas: RefCell<HashMap<u64, TrackMeta>>,
@@ -268,6 +270,16 @@ impl ZekeWindow {
                 w.send(PlayerCommand::SetShuffle(on));
             })
             .build();
+        // The queue rows' remove buttons, with the entry's qid.
+        let queue_remove = gio::ActionEntry::builder("queue-remove")
+            .parameter_type(Some(glib::VariantTy::STRING))
+            .activate(|w: &Self, _, qid| {
+                // "" is the target of a row not bound yet.
+                if let Some(qid) = qid.and_then(|q| q.get::<String>()).filter(|q| !q.is_empty()) {
+                    w.send(PlayerCommand::Remove(qid));
+                }
+            })
+            .build();
         self.add_action_entries([
             simple("play-pause", |w| w.send(PlayerCommand::TogglePause)),
             simple("next", |w| w.send(PlayerCommand::Next)),
@@ -281,6 +293,7 @@ impl ZekeWindow {
                 w.send(PlayerCommand::SetRepeat(next));
             }),
             shuffle,
+            queue_remove,
             simple("logout", Self::logout),
             simple("preferences", crate::preferences::ZekePreferences::present),
             simple("search", Self::focus_search),
