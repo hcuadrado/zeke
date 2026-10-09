@@ -3430,6 +3430,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "webkit6",
+ "zbus 5.19.0",
  "zeke-engine",
  "zeke-player",
  "zeke-plugin",

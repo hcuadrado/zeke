@@ -5,6 +5,7 @@ mod browse;
 mod covers;
 mod errors;
 mod hearts;
+mod inhibit;
 mod login;
 #[cfg(feature = "webview")]
 mod login_window;

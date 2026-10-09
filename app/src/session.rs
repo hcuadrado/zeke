@@ -21,6 +21,7 @@ use zeke_player::{
 use zeke_tidal::client_lock::{self, Caller};
 use zeke_tidal::{AppState, ColorScheme, PlaylistSort, Settings, TidalError};
 
+use crate::inhibit::{self, Logind};
 use crate::mpris::{MprisCommand, MprisHandle};
 use crate::runtime::runtime;
 
@@ -165,7 +166,11 @@ impl Session {
         let (cmd_tx, cmd_rx) = async_channel::unbounded::<PlayerCommand>();
         let mpris = MprisHandle::start(cmd_tx.clone(), ui_tx.clone());
         let (stopped_tx, stopped) = std::sync::mpsc::channel();
-        let run = run(Arc::clone(&state), settings.clone(), cmd_rx, ui_tx, mpris.clone());
+        // The task ends, and lets go of the lock, when the event hub ends
+        // and drops the sender.
+        let (awake_tx, awake_rx) = tokio::sync::watch::channel(false);
+        runtime().spawn(inhibit::hold(awake_rx, Logind::default()));
+        let run = run(Arc::clone(&state), settings.clone(), cmd_rx, ui_tx, mpris.clone(), awake_tx);
         runtime().spawn(async move {
             run.await;
             let _ = stopped_tx.send(());
@@ -391,6 +396,7 @@ async fn run(
     commands: async_channel::Receiver<PlayerCommand>,
     ui: async_channel::Sender<UiEvent>,
     mpris: MprisHandle,
+    awake: tokio::sync::watch::Sender<bool>,
 ) {
     // The engine's constructor initialises GStreamer and starts its thread.
     let (events_tx, events_rx) = events::channel();
@@ -477,7 +483,7 @@ async fn run(
         let _ = player.commands.send(PlayerCommand::Restore(Box::new(saved))).await;
     }
 
-    let hub = tokio::spawn(hub(state, player.updates.clone(), ui, mpris, probe));
+    let hub = tokio::spawn(hub(state, player.updates.clone(), ui, mpris, probe, awake));
     // UI and MPRIS → player, until the app shuts down.
     while let Ok(c) = commands.recv().await {
         if player.commands.send(c).await.is_err() {
@@ -537,6 +543,7 @@ async fn hub(
     ui: async_channel::Sender<UiEvent>,
     mpris: MprisHandle,
     probe: Arc<PipelineProbe>,
+    awake: tokio::sync::watch::Sender<bool>,
 ) {
     let mut cache: HashMap<u64, TrackMeta> = HashMap::new();
     let mut failed: HashMap<u64, std::time::Instant> = HashMap::new();
@@ -596,6 +603,10 @@ async fn hub(
         match update {
             Update::Player(PlayerEvent::State(s)) => {
                 playing = s == PlaybackState::Playing;
+                // Only a change is sent: a failed lock is retried on the
+                // next play.
+                let hold = inhibit::keeps_awake(s);
+                awake.send_if_modified(|held| std::mem::replace(held, hold) != hold);
                 mpris.send(MprisCommand::Status(s));
                 let _ = ui.send(UiEvent::State(s)).await;
             }
